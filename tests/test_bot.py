@@ -575,15 +575,17 @@ class _FakeMetricsEx:
     def __init__(self):
         self.calls = 0
         now = int(pd.Timestamp.now(tz="UTC").floor("h").timestamp() * 1000)
-        self.ts = [now - k * 3600_000 for k in range(5, 0, -1)]
+        self.ts = [now - k * 3600_000 for k in range(1200, 0, -1)]   # 50 gün: API penceresinden uzun
 
     def market(self, s):
         return {"id": s.split(":")[0].replace("/", "")}
 
     def _rows(self, params, fields):
+        # Binance davranışı: endTime'dan önceki en son `limit` kayıt
         self.calls += 1
-        return [{"timestamp": t, **{k: str(1 + j * 0.1) for j, k in enumerate(fields)}}
-                for t in self.ts if t >= params["startTime"]]
+        rows = [{"timestamp": t, **{k: str(1 + j * 0.1) for j, k in enumerate(fields)}}
+                for t in self.ts if t <= params.get("endTime", 10**15)]
+        return rows[-params["limit"]:]
 
     def fapiDataGetOpenInterestHist(self, p): return self._rows(p, ["sumOpenInterest", "sumOpenInterestValue"])
     def fapiDataGetTopLongShortPositionRatio(self, p): return self._rows(p, ["longShortRatio", "longAccount", "shortAccount"])
@@ -598,11 +600,12 @@ def test_collector_merges_without_duplicates(tmp_path, monkeypatch):
     cfg = {"exchange": {"symbols": ["BTC/USDT", "ETH/USDT"]}}
     ex = _FakeMetricsEx()
     s1 = collector.collect_recent(cfg, ex)
-    assert s1[("BTC/USDT", "open_interest")] == 5
+    n = s1[("BTC/USDT", "open_interest")]
+    assert 29 * 24 - 2 <= n <= 29 * 24 + 1                            # 500'lük sayfalarla tüm 29 gün
     s2 = collector.collect_recent(cfg, ex)                            # tekrar: yeni kayıt yok
     assert all(v == 0 for v in s2.values())
     m = collector.load_metrics("BTC/USDT:USDT")
-    assert len(m) == 5 and "open_interest_oi" in m and "taker_ratio_ratio" in m
+    assert len(m) == n and "open_interest_oi" in m and "taker_ratio_ratio" in m
 
 
 def test_archive_parser():

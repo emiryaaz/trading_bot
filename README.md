@@ -1,4 +1,4 @@
-# Finans İşlem Botu (Binance Futures, v0.6)
+# Finans İşlem Botu (Binance Futures, v0.6.1)
 
 Binance **global USDⓈ-M Futures** üzerinde, **isolated marjin** ve düşük kaldıraçla (varsayılan 2x)
 **long ve short** yönlü, **10 coin** üzerinde otomatik işlem yapan bot:
@@ -28,7 +28,8 @@ python -m pytest -q                # testler (internet gerekmez)
 | `python main.py layers --tf 4h` | Aynı katman testini 4 saatlik mumlarla yapar |
 | `python main.py backtest --refresh` | Veriyi yeniden indirir |
 | `python main.py collect` | Open interest ve long/short oranlarını indirip `data/metrics/` altında biriktirir |
-| `python main.py collect --archive 365` | (deneysel) Binance veri arşivinden geçmişi doldurmayı dener |
+| `python main.py collect --archive 365` | Binance veri arşivinden (data.binance.vision) 1 yıllık saatlik geçmişi paralel indirir; yarıda kalırsa tekrar çalıştırmak yeterli |
+| `python main.py analyze` | OI / long-short / taker metrikleri sonraki 24 saatlik getiriyi öngörüyor mu? (sadece eğitim dönemi, tüm coinler) |
 | `python main.py info` | Her coinin borsa limitleri ve mevcut ayarlarla gereken **minimum sermaye** |
 | `python main.py run` | `config.yaml`'daki moda göre botu başlatır |
 | `python main.py status` | Bot bakiyesi, devre kesici seviyesi, açık pozisyon, son işlemler |
@@ -90,7 +91,9 @@ otomatikleştirmek için (klasör yolunu kendi yolunuzla değiştirin):
 schtasks /create /tn "trading_bot_collect" /sc daily /st 09:00 /tr "cmd /c cd /d C:\Users\emiry\Documents\trading_bot && .venv\Scripts\python.exe main.py collect"
 ```
 
-Bu veriler birkaç ay birikince stratejiye yeni katman olarak eklenip test edilecek.
+Arşiv (data.binance.vision) bu metriklerin 1 saatlik geçmişini de içeriyor; `collect --archive 365` ile
+indirilir. `python main.py analyze` hangi metriğin gerçekten bilgi taşıdığını gösterir; sadece anlamlı çıkanlar
+stratejiye katman olarak eklenmelidir.
 
 ## Risk kuralları (config.yaml → risk)
 

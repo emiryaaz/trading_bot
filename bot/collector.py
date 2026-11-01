@@ -77,22 +77,23 @@ def _rows_to_df(rows: list[dict], cols: dict) -> pd.DataFrame:
 
 
 def fetch_metric(ex, symbol: str, metric: str, since_ms: int) -> pd.DataFrame:
-    """Bir metriği `since_ms`'den bugüne sayfa sayfa indirir."""
+    """Bir metriği bugünden geriye doğru `since_ms`'e kadar sayfa sayfa indirir.
+    (Binance bu uçlarda yalnız startTime verilince son 500 kaydı döndürüyor; bu yüzden endTime ile geriye gidilir.)"""
     method, cols = ENDPOINTS[metric]
     sym_id = ex.market(symbol)["id"]
     fn = getattr(ex, method)
-    rows, start = [], since_ms
-    now = int(time.time() * 1000)
-    while start < now:
-        batch = fn({"symbol": sym_id, "period": PERIOD, "limit": PAGE, "startTime": int(start)})
+    rows, end = [], int(time.time() * 1000)
+    for _ in range(20):                             # 20 x 500 saat >> 30 gün; sonsuz döngü güvencesi
+        batch = fn({"symbol": sym_id, "period": PERIOD, "limit": PAGE, "endTime": int(end)})
         if not batch:
             break
         rows += batch
-        last = int(batch[-1]["timestamp"])
-        if last <= start or len(batch) < PAGE:
+        first = min(int(r["timestamp"]) for r in batch)
+        if first <= since_ms or len(batch) < PAGE:
             break
-        start = last + 1
+        end = first - 1
         time.sleep(0.15)                            # istek limitlerine saygı
+    rows = [r for r in rows if int(r["timestamp"]) >= since_ms]
     return _rows_to_df(rows, cols)
 
 
@@ -162,35 +163,45 @@ def parse_archive_csv(raw: bytes) -> pd.DataFrame:
     return df.apply(pd.to_numeric, errors="coerce")
 
 
-def backfill_archive(cfg: dict, days: int, log=print) -> dict:
-    """data.binance.vision günlük 'metrics' dosyalarından geçmişi doldurmayı dener (1 saatlik örnekleme)."""
+def _download_day(session, url):
+    try:
+        r = session.get(url, timeout=30)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        return parse_archive_csv(r.content), None
+    except Exception as e:
+        return None, str(e)
+
+
+def backfill_archive(cfg: dict, days: int, log=print, workers: int = 8) -> dict:
+    """data.binance.vision günlük 'metrics' dosyalarından geçmişi doldurur (1 saatlik örnekleme).
+    Paralel indirir; daha önce indirilen günleri atlar (yarıda kalırsa tekrar çalıştırmak yeterli)."""
+    from concurrent.futures import ThreadPoolExecutor
+
     import requests
 
     summary = {}
     today = datetime.now(timezone.utc).date()
+    session = requests.Session()
     for s in cfg["exchange"]["symbols"]:
         sid = s.replace("/", "")
         out = METRICS_DIR / f"{sid}_archive.csv"
         have = set()
         if out.exists():
             have = {d.date() for d in pd.read_csv(out, index_col=0, parse_dates=True).index}
+        todo = [today - timedelta(days=k) for k in range(days, 0, -1)]
+        todo = [d for d in todo if d not in have]
+        urls = [ARCHIVE_URL.format(id=sid, day=d.isoformat()) for d in todo]
         frames, ok, missing = [], 0, 0
-        for k in range(days, 0, -1):
-            day = today - timedelta(days=k)
-            if day in have:
-                continue
-            url = ARCHIVE_URL.format(id=sid, day=day.isoformat())
-            try:
-                r = requests.get(url, timeout=20)
-                if r.status_code != 200:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for (df, err), day in zip(pool.map(lambda u: _download_day(session, u), urls), todo):
+                if df is None:
                     missing += 1
-                    continue
-                frames.append(parse_archive_csv(r.content))
-                ok += 1
-            except Exception as e:
-                missing += 1
-                if missing <= 3:
-                    log(f"  {s} {day}: {e}")
+                    if missing <= 2 and err and not err.startswith("HTTP 404"):
+                        log(f"  {s} {day}: {err}")
+                else:
+                    frames.append(df)
+                    ok += 1
         if frames:
             df = pd.concat(frames)
             df = df[~df.index.duplicated()].sort_index().resample("1h").last().dropna(how="all")

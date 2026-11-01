@@ -7,6 +7,7 @@
     python main.py layers --tf 4h       # aynı test 4 saatlik mumlarla
     python main.py collect              # open interest + long/short oranlarını topla (son 30 gün)
     python main.py collect --archive 365  # + arşivden geçmişi doldurmayı dene
+    python main.py analyze              # OI / long-short metrikleri gelecekteki getiriyi öngörüyor mu?
     python main.py info                  # her coinin borsa limitleri ve gereken minimum sermaye
     python main.py run                   # config.yaml'daki moda göre botu başlat (paper/testnet/live)
     python main.py status                # durum, açık pozisyon ve son işlemler
@@ -222,6 +223,55 @@ def cmd_collect(cfg, archive_days):
           "en az 3 haftada bir çalıştırın.")
 
 
+def cmd_analyze(cfg, split, horizon):
+    """Open interest / long-short / taker metriklerinin sonraki `horizon` saatlik getiriyle ilişkisi.
+    Sadece EĞİTİM döneminde ölçülür. Tüm coinler birlikte değerlendirilir (her coin kendi içinde sıralanır)."""
+    import numpy as np
+    from bot.collector import METRICS_DIR
+    data, _ = load_history(cfg)
+    names = ["oi", "oi_value", "top_acct_ratio", "top_pos_ratio", "global_ratio", "taker_ratio"]
+    pooled, coins = [], []
+    for sym, px in data.items():
+        path = METRICS_DIR / f"{sym.replace('/', '')}_archive.csv"
+        if not path.exists():
+            continue
+        a = pd.read_csv(path, index_col=0, parse_dates=True)
+        a.columns = names[:len(a.columns)]
+        df = px.join(a, how="inner")
+        cut = df.index[int(len(df) * split)]
+        tr = df.loc[:cut]
+        c = tr["close"]
+        feats = pd.DataFrame({
+            "OI 24s değişim": tr["oi"].pct_change(24),
+            "OI değişimi x fiyat yönü": tr["oi"].pct_change(24) * np.sign(c.pct_change(24)),
+            "Büyük trader pozisyon L/S": tr["top_pos_ratio"],
+            "Büyük trader hesap L/S": tr["top_acct_ratio"],
+            "Tüm hesaplar L/S": tr["global_ratio"],
+            "Taker alış/satış (24s ort.)": tr["taker_ratio"].rolling(24).mean(),
+            "(referans) son 24s getiri": c.pct_change(24),
+        })
+        ranked = feats.rank(pct=True)                   # her coin kendi içinde sıralanır
+        ranked["fwd"] = c.shift(-horizon) / c - 1
+        pooled.append(ranked.iloc[::horizon].dropna())  # örtüşmeyen pencereler
+        coins.append(sym)
+    if not pooled:
+        print("Arşiv verisi yok. Önce: python main.py collect --archive 365")
+        return
+    d = pd.concat(pooled)
+    n = len(d)
+    rows = []
+    for col in [c for c in d.columns if c != "fwd"]:
+        q = pd.qcut(d[col], 5, labels=False, duplicates="drop")
+        g = d.groupby(q)["fwd"].mean() * 100
+        rows.append({"Metrik": col, "Sıra korelasyonu": round(d[col].corr(d["fwd"], method="spearman"), 3),
+                     f"En düşük %20 → {horizon}s getiri %": round(g.iloc[0], 2),
+                     f"En yüksek %20 → {horizon}s getiri %": round(g.iloc[-1], 2)})
+    pd.set_option("display.width", 220)
+    print(f"{len(coins)} coin ({', '.join(c.split('/')[0] for c in coins)}) | eğitim dönemi | {n} gözlem\n")
+    print(pd.DataFrame(rows).set_index("Metrik").to_string())
+    print(f"\nKaba anlamlılık eşiği: |korelasyon| > {2 / np.sqrt(n):.3f}. Bunun altındakiler büyük olasılıkla gürültüdür.")
+
+
 def cmd_info(cfg):
     from bot.exchange import FuturesExchange
     ex = FuturesExchange(cfg["exchange"]["name"])
@@ -293,7 +343,8 @@ def cmd_resume(cfg):
 
 def main():
     ap = argparse.ArgumentParser(description="Finans İşlem Botu (Binance Futures)")
-    ap.add_argument("command", choices=["backtest", "layers", "collect", "info", "run", "status", "report", "resume"])
+    ap.add_argument("command", choices=["backtest", "layers", "collect", "analyze", "info", "run", "status", "report",
+                                        "resume"])
     ap.add_argument("--config", default=None)
     ap.add_argument("--synthetic", action="store_true", help="sahte veriyle backtest")
     ap.add_argument("--refresh", action="store_true", help="geçmiş veriyi yeniden indir")
@@ -301,11 +352,13 @@ def main():
     ap.add_argument("--split", type=float, default=0.7, help="eğitim/test ayrımı (0 = ayırma)")
     ap.add_argument("--tf", default=None, help="layers için zaman dilimi (ör. 4h; 1s veriden üretilir)")
     ap.add_argument("--archive", type=int, default=0, help="collect: arşivden kaç günlük geçmiş denensin")
+    ap.add_argument("--horizon", type=int, default=24, help="analyze: kaç saatlik ileri getiri")
     a = ap.parse_args()
     cfg = load_config(a.config)
     {"backtest": lambda: cmd_backtest(cfg, a.synthetic, a.refresh, a.split, a.compare),
      "layers": lambda: cmd_layers(cfg, a.split or 0.7, a.tf),
      "collect": lambda: cmd_collect(cfg, a.archive),
+     "analyze": lambda: cmd_analyze(cfg, a.split or 0.7, a.horizon),
      "info": lambda: cmd_info(cfg), "run": lambda: cmd_run(cfg), "status": lambda: cmd_status(cfg),
      "report": lambda: cmd_report(cfg), "resume": lambda: cmd_resume(cfg)}[a.command]()
 
