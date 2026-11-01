@@ -55,11 +55,20 @@ class RiskManager:
             return None
         if self.c["stop_mode"] == "atr" and atr <= 0:
             return None
-        margin = min(equity * self.c["margin_per_trade_pct"], available * 0.98)
+        stop, tp = self.protection_prices(price, side, atr)
+        margin_cap = min(equity * self.c["margin_per_trade_pct"], available * 0.98)
+        risk_pct = self.c.get("risk_per_trade_pct", 0) or 0
+        if self.c["stop_mode"] == "atr" and risk_pct > 0:
+            # Oynaklığa göre boyut: stop'a takılınca kayıp = bakiye x risk_pct olacak şekilde
+            stop_dist = abs(price - stop)
+            if stop_dist <= 0:
+                return None
+            margin = min(equity * risk_pct / stop_dist * price / self.lev, margin_cap)
+        else:
+            margin = margin_cap
         if margin <= 0:
             return None
         qty = margin * self.lev / price
-        stop, tp = self.protection_prices(price, side, atr)
         liq = liquidation_price(price, side, self.lev)
         # stop, likidasyon fiyatından önce gelmeli
         if (side == LONG and stop <= liq) or (side == SHORT and stop >= liq) or stop <= 0:

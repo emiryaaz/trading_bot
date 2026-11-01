@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .backtest import attach_funding
 from .config import ROOT, futures_symbol
 from .exchange import FuturesClient, PaperFutures, Position, now_ms
 from .logger import Notifier, get_logger
@@ -48,6 +49,11 @@ class Trader:
         self.allow_short = cfg["futures"].get("allow_short", True)
         self.max_pos = cfg["risk"].get("max_open_positions", 1)
         self.max_margin = cfg["risk"].get("max_total_margin_pct", 1.0)
+        exe = cfg.get("execution", {})
+        self.use_limit = exe.get("entry_order", "market") == "limit"
+        self.limit_offset = float(exe.get("limit_offset_atr", 0.0))
+        self.limit_ttl = int(exe.get("limit_ttl_bars", 1))
+        self.needs_funding = bool(getattr(strategy, "params", {}).get("use_funding"))
         self.log = get_logger()
         self.notify = notifier or Notifier()
         self.state_path = state_path or ROOT / cfg["live"]["state_file"]
@@ -56,7 +62,7 @@ class Trader:
 
     # ================================================================ durum
     def _load_state(self) -> dict:
-        default = {"positions": {}, "last_candle": {}, "day": None, "day_start_equity": None,
+        default = {"positions": {}, "pending": {}, "last_candle": {}, "day": None, "day_start_equity": None,
                    "realized": 0.0, "trades": [], "halted": False, "halt_reason": None,
                    "last_report": None, "session": {"start": _now(), "baseline": self.capital},
                    "paper": None, "warned_foreign": []}
@@ -92,8 +98,17 @@ class Trader:
         unreal = sum(self._ex_pos[s].unrealized for s in self.positions if s in self._ex_pos)
         return self.capital + self.state["realized"] + unreal
 
+    @property
+    def pending(self) -> dict:
+        return self.state.setdefault("pending", {})
+
     def used_margin(self) -> float:
-        return sum(p["margin"] for p in self.positions.values())
+        """Açık pozisyonların + bekleyen limit emirlerin teminatı."""
+        return (sum(p["margin"] for p in self.positions.values())
+                + sum(o["margin"] for o in self.pending.values()))
+
+    def slots_used(self) -> int:
+        return len(self.positions) + len(self.pending)
 
     def _record(self, sym: str, exit_px: float, pnl: float, fees: float, funding: float, reason: str) -> None:
         p = self.positions.pop(sym)
@@ -138,7 +153,60 @@ class Trader:
             pnl = p["side"] * (exit_px - p["entry"]) * p["qty"] - 2 * p["entry_fee"]
             self._record(sym, exit_px, pnl, 2 * p["entry_fee"], 0.0, reason + " (yaklaşık)")
 
+    def _adopt(self, sym: str, side: int, qty: float, price: float, fee: float, atr: float,
+               opened_ms: int, how: str) -> None:
+        """Dolmuş bir girişi pozisyon olarak kaydeder ve stop / kâr-al emirlerini borsaya koyar."""
+        stop, tp = self.risk.protection_prices(price, side, atr)
+        stop = self.ex.round_price(sym, stop)
+        tp = self.ex.round_price(sym, tp) if tp else 0.0
+        self.positions[sym] = {"side": side, "qty": qty, "entry": price, "entry_fee": fee,
+                               "margin": qty * price / self.lev, "stop": stop, "take_profit": tp,
+                               "opened": _now(), "opened_ms": opened_ms}
+        self._ex_pos[sym] = Position(side, qty, price)
+        self.save()                                    # pozisyon bilgisini hemen diske yaz
+        try:
+            self.ex.place_protection(sym, Position(side, qty, price), stop, tp)
+        except Exception as e:
+            self.log.exception(f"{sym}: stop / kâr-al emri konamadı!")
+            self.notify.send(f"UYARI: {sym} koruma emri konamadı ({e}). Pozisyon güvenlik için kapatılıyor.")
+            self._close(sym, "koruma emri hatası")
+            return
+        self.notify.send(f"AÇILDI {sym.split(':')[0]} {_name(side)} {qty} @ {price:g} ({how}) | teminat "
+                         f"{self.positions[sym]['margin']:.2f} USDT | stop {stop:g}"
+                         + (f" | kâr-al {tp:g}" if tp else "")
+                         + f" | açık pozisyon {len(self.positions)}/{self.max_pos}")
+
+    def _process_pending(self, new_candle_syms: set) -> None:
+        """Bekleyen limit emirleri: dolanları pozisyona çevir, süresi dolanları iptal et."""
+        for sym in list(self.pending):
+            o = self.pending[sym]
+            if sym in new_candle_syms:
+                o["candles"] = o.get("candles", 0) + 1
+            expired = o.get("candles", 0) >= self.limit_ttl
+            st = self.ex.cancel_entry(sym, o["id"]) if expired else self.ex.entry_status(sym, o["id"])
+            if st["status"] == "open":
+                continue
+            self.pending.pop(sym)
+            if st["filled"] > 0:
+                how = "limit" if st["status"] == "filled" else "limit, kısmi"
+                self._adopt(sym, o["side"], st["filled"], st["price"] or o["price"], st["fee"], o["atr"],
+                            o["placed_ms"], how)
+            elif expired:
+                self.log.info(f"{sym}: limit emir {self.limit_ttl} mum içinde dolmadı, iptal edildi.")
+            else:
+                self.log.info(f"{sym}: limit emir borsa tarafından iptal edildi (post-only: fiyat zaten geçmişti).")
+
+    def _cancel_all_pending(self) -> None:
+        for sym in list(self.pending):
+            o = self.pending.pop(sym)
+            st = self.ex.cancel_entry(sym, o["id"])
+            if st["filled"] > 0:                       # kısmen dolmuşsa önce sahiplen, sonra kapatılacak
+                self._adopt(sym, o["side"], st["filled"], st["price"] or o["price"], st["fee"], o["atr"],
+                            o["placed_ms"], "limit, kısmi")
+
     def _open(self, sym: str, side: int, price: float, atr: float) -> None:
+        if self.use_limit:
+            price = price - side * self.limit_offset * atr
         eq = self.equity()
         used = self.used_margin()
         room = max(0.0, eq * self.max_margin - used)
@@ -155,28 +223,21 @@ class Trader:
             return
 
         opened_ms = now_ms() - 2000
-        fill = self.ex.open_position(sym, side, qty)
-        stop, tp = self.risk.protection_prices(fill.price, side, atr)
-        stop = self.ex.round_price(sym, stop)
-        tp = self.ex.round_price(sym, tp) if tp else 0.0
-        self.positions[sym] = {"side": side, "qty": fill.qty, "entry": fill.price, "entry_fee": fill.fee,
-                               "margin": fill.qty * fill.price / self.lev, "stop": stop, "take_profit": tp,
-                               "opened": _now(), "opened_ms": opened_ms}
-        self._ex_pos[sym] = Position(side, fill.qty, fill.price)
-        self.save()                                    # pozisyon bilgisini hemen diske yaz
-        try:
-            self.ex.place_protection(sym, Position(side, fill.qty, fill.price), stop, tp)
-        except Exception as e:
-            self.log.exception(f"{sym}: stop / kâr-al emri konamadı!")
-            self.notify.send(f"UYARI: {sym} koruma emri konamadı ({e}). Pozisyon güvenlik için kapatılıyor.")
-            self._close(sym, "koruma emri hatası")
+        if self.use_limit:
+            price = self.ex.round_price(sym, price)
+            oid = self.ex.place_limit_entry(sym, side, qty, price)
+            self.pending[sym] = {"id": oid, "side": side, "qty": qty, "price": price, "atr": atr,
+                                 "margin": qty * price / self.lev, "placed": _now(), "placed_ms": opened_ms,
+                                 "candles": 0}
+            self.save()
+            self.log.info(f"{sym}: {_name(side)} limit emir {qty} @ {price:g} kondu "
+                          f"({self.limit_ttl} mum geçerli).")
             return
-        self.notify.send(f"AÇILDI {sym.split(':')[0]} {_name(side)} {fill.qty} @ {fill.price:g} | teminat "
-                         f"{self.positions[sym]['margin']:.2f} USDT | stop {stop:g}"
-                         + (f" | kâr-al {tp:g}" if tp else "")
-                         + f" | açık pozisyon {len(self.positions)}/{self.max_pos}")
+        fill = self.ex.open_position(sym, side, qty)
+        self._adopt(sym, side, fill.qty, fill.price, fill.fee, atr, opened_ms, "piyasa")
 
     def _close_all(self, reason: str) -> None:
+        self._cancel_all_pending()
         for sym in list(self.positions):
             self._close(sym, reason)
 
@@ -204,13 +265,15 @@ class Trader:
             return False
 
         prices = self.ex.fetch_prices(self.symbols)
+        if self.pending:
+            self._process_pending(set())               # dolan limit emirler pozisyona dönüşür
         self._ex_pos = self.ex.get_positions(self.symbols)
 
         # --- borsa ile senkronizasyon
         for sym in list(self.positions):
             if sym not in self._ex_pos:
                 self._on_exchange_close(sym, prices.get(sym, self.positions[sym]["entry"]))
-        foreign = {s for s in self._ex_pos if s not in self.positions}
+        foreign = {s for s in self._ex_pos if s not in self.positions and s not in self.pending}
         for s in foreign - set(st["warned_foreign"]):
             self.notify.send(f"UYARI: Hesapta {s} için botun açmadığı bir pozisyon var. "
                              "Bot ona dokunmaz ve o kapanana kadar bu coinde işlem açmaz.")
@@ -229,18 +292,34 @@ class Trader:
             self._halt(f"%{pct:.0f} kayıp sınırına ulaşıldı ({base:.2f} → {self.equity():.2f} USDT)")
             return False
 
-        # --- her coin için yeni kapanmış mum?
-        signals = {}
+        # --- her coin için yeni kapanmış mum?  (önce ucuz kontrol, sonra gerekiyorsa tam geçmiş)
+        new = []
         for sym in self.symbols:
-            df = self.ex.fetch_ohlcv(sym, self.tf, limit=self.strategy.warmup + 100)
-            closed = df.iloc[:-1]                      # son mum henüz kapanmadı
-            if len(closed) < self.strategy.warmup:
-                continue
-            ts = str(closed.index[-1])
-            if ts == st["last_candle"].get(sym):
-                continue
-            st["last_candle"][sym] = ts
-            signals[sym] = self.strategy.generate(closed).iloc[-1]
+            tail = self.ex.fetch_ohlcv(sym, self.tf, limit=3)
+            if len(tail) >= 2 and str(tail.index[-2]) != st["last_candle"].get(sym):
+                new.append(sym)
+        signals = {}
+        if new:
+            hist_limit = max(self.strategy.warmup + 100, 1000)   # göstergelerin backtest ile aynı oturması için
+            btc_sym = next((s for s in self.symbols if s.upper().startswith("BTC/")), "BTC/USDT:USDT")
+            btc_closed = None
+            if self.strategy.uses_btc:
+                btc_closed = self.ex.fetch_ohlcv(btc_sym, self.tf, limit=hist_limit).iloc[:-1]
+            for sym in new:
+                closed = (btc_closed if (sym == btc_sym and btc_closed is not None)
+                          else self.ex.fetch_ohlcv(sym, self.tf, limit=hist_limit).iloc[:-1])  # son mum kapanmadı
+                if len(closed) < self.strategy.warmup:
+                    continue
+                st["last_candle"][sym] = str(closed.index[-1])
+                ctx = None if sym == btc_sym else btc_closed
+                if self.needs_funding:
+                    try:
+                        closed = attach_funding(closed, self.ex.fetch_funding_recent(sym, 200))
+                    except Exception as e:
+                        self.log.warning(f"{sym}: funding verisi alınamadı ({e})")
+                signals[sym] = self.strategy.generate(closed, ctx).iloc[-1]
+            if self.pending:
+                self._process_pending(set(signals))    # süresi dolan limit emirleri iptal et
 
         if signals:
             self.log.info("Yeni mum | " + " ".join(
@@ -256,17 +335,19 @@ class Trader:
             # sonra girişler (config sırası öncelik)
             wants = [(s, LONG if r["long_entry"] else -1) for s, r in signals.items()
                      if r["long_entry"] or (r["short_entry"] and self.allow_short)]
-            wants = [(s, side) for s, side in wants if s not in self.positions and s not in foreign]
+            wants = [(s, side) for s, side in wants
+                     if s not in self.positions and s not in self.pending and s not in foreign]
             if wants:
                 if self.risk.daily_limit_hit(st["day_start_equity"], self.equity()):
                     self.notify.send("Günlük zarar limitine ulaşıldı: bugün yeni işlem açılmayacak.")
                 else:
                     for sym, side in wants:
-                        if len(self.positions) >= self.max_pos:
+                        if self.slots_used() >= self.max_pos:
                             self.log.info(f"{sym}: {_name(side)} sinyali var ama pozisyon sınırı dolu "
                                           f"({self.max_pos}).")
                             continue
-                        self._open(sym, side, self.ex.fetch_price(sym), float(signals[sym]["atr"]))
+                        px = float(signals[sym]["close"]) if self.use_limit else self.ex.fetch_price(sym)
+                        self._open(sym, side, px, float(signals[sym]["atr"]))
 
         self.save()
         return True
@@ -281,7 +362,12 @@ class Trader:
                          f"{self.lev}x isolated | en fazla {self.max_pos} pozisyon | bot bakiyesi "
                          f"{self.equity():.2f} USDT | devre kesici {lim:.2f}")
         errors = 0
+        last_collect = 0.0
         while True:
+            if not isinstance(self.ex, PaperFutures) or self.cfg.get("collect_in_paper", True):
+                if time.time() - last_collect > 24 * 3600:     # günde bir: OI / long-short kaydı
+                    last_collect = time.time()
+                    self._collect_metrics()
             try:
                 if not self.step():
                     break
@@ -300,6 +386,15 @@ class Trader:
                 time.sleep(min(30 * errors, 300))
                 continue
             time.sleep(self.cfg["live"]["poll_seconds"])
+
+    def _collect_metrics(self) -> None:
+        try:
+            from .collector import collect_recent
+            ex = self.ex.src.ex if isinstance(self.ex, PaperFutures) else self.ex.ex
+            collect_recent(self.cfg, ex, log=self.log.warning)
+            self.log.info("Open interest / long-short verisi güncellendi (data/metrics).")
+        except Exception as e:                         # toplama hatası işlemleri etkilememeli
+            self.log.warning(f"Metrik toplama başarısız: {e}")
 
     # ================================================================ yeniden başlatma
     def resume(self) -> float:

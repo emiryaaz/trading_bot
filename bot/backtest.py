@@ -68,6 +68,7 @@ class BacktestResult:
     initial: float = 0.0
     buy_hold: dict = field(default_factory=dict)      # coin -> al-ve-tut getirisi
     bars_per_year: float = 8760
+    closes: pd.DataFrame | None = None                # coin kapanış fiyatları (dönem al-ve-tut için)
 
     @property
     def buy_hold_return(self) -> float:
@@ -104,6 +105,21 @@ class BacktestResult:
             "Sharpe (yıllık)": round(float(sharpe), 2),
         }
 
+    def subset(self, start=None, end=None) -> "BacktestResult":
+        """Aynı simülasyonun bir dönemi: yalnızca o dönemde AÇILAN işlemler ve o dönemin bakiye eğrisi.
+        Göstergeler önceki veriyle ısınmış olduğu için eğitim/test ayrımında doğru yöntem budur."""
+        eq = self.equity
+        before = eq.loc[:start].iloc[:-1] if start is not None else eq.iloc[:0]
+        initial = float(before.iloc[-1]) if len(before) else self.initial
+        part_eq = eq.loc[start:end]
+        tr = [t for t in self.trades if (start is None or t.entry_time >= start) and (end is None or t.entry_time < end)]
+        ev = [e for e in self.breaker_events if (start is None or e["time"] >= start) and (end is None or e["time"] < end)]
+        bh = self.buy_hold
+        if self.closes is not None:
+            c = self.closes.loc[start:end]
+            bh = {k: float(c[k].dropna().iloc[-1] / c[k].dropna().iloc[0] - 1) for k in c if c[k].notna().sum() > 1}
+        return BacktestResult(part_eq, tr, ev, initial, bh, self.bars_per_year, self.closes)
+
     def per_symbol(self) -> pd.DataFrame:
         rows = []
         for sym in sorted({t.symbol for t in self.trades} | set(self.buy_hold), key=str):
@@ -135,11 +151,25 @@ def _funding_rates(index: pd.DatetimeIndex, funding: pd.Series | None, fallback:
     return rates
 
 
+def attach_funding(df: pd.DataFrame, funding: pd.Series | None) -> pd.DataFrame:
+    """Son ödenmiş funding oranını her muma 'funding_rate' kolonu olarak ekler (geleceği görmeden:
+    T anındaki ödeme oranı, T'de açılan mumdan itibaren bilinir)."""
+    if funding is None or not len(funding) or "funding_rate" in df:
+        return df
+    f = funding.copy()
+    f.index = f.index.floor("h")
+    f = f[~f.index.duplicated(keep="last")].sort_index()
+    out = df.copy()
+    out["funding_rate"] = f.reindex(out.index, method="ffill")
+    return out
+
+
 class _Sym:
     """Tek bir coinin ortak zaman çizelgesine hizalanmış dizileri."""
 
-    def __init__(self, name, df, strategy, index, funding, fallback):
-        sig = strategy.generate(df).reindex(index)
+    def __init__(self, name, df, strategy, index, funding, fallback, btc=None):
+        df = attach_funding(df, funding)
+        sig = strategy.generate(df, btc).reindex(index)
         self.name = name
         self.o, self.h, self.l, self.c = (sig[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
         self.le, self.se, self.lx, self.sx = (sig[k].fillna(False).to_numpy(dtype=bool)
@@ -155,17 +185,33 @@ class _Sym:
 def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strategy, risk: RiskManager,
                  initial: float, fee_rate: float, slippage: float,
                  allow_short: bool = True, funding: pd.Series | dict | None = None,
-                 funding_fallback: float = 0.0001, bars_per_year: float = 8760) -> BacktestResult:
+                 funding_fallback: float = 0.0001, bars_per_year: float = 8760,
+                 maker_fee: float | None = None, entry_order: str = "market",
+                 limit_offset_atr: float = 0.0, limit_ttl_bars: int = 1,
+                 tp_order: str = "market") -> BacktestResult:
+    """fee_rate = taker (piyasa emri) ücreti, maker_fee = limit emir ücreti.
+
+    entry_order="limit": sinyal mumunun kapanışında (kapanış -/+ limit_offset_atr x ATR) fiyatına deftere
+    limit emir konur. Sonraki `limit_ttl_bars` mum içinde fiyat bu seviyeyi GEÇERSE (sadece dokunması yetmez)
+    emir maker olarak dolar; geçmezse iptal edilir. Fiyat seviyenin ötesinde açılırsa açılış fiyatından dolar.
+    tp_order="limit": kâr-al deftere yazılı limit emirdir (maker, kaymasız). Stop-loss her zaman piyasa emridir.
+    """
+    taker_fee = fee_rate
+    maker_fee = taker_fee if maker_fee is None else maker_fee
     if isinstance(data, pd.DataFrame):
         data = {"COIN": data}
     if funding is None or isinstance(funding, pd.Series):
         funding = {s: funding for s in data}
     index = sorted(set().union(*[d.index for d in data.values()]))
     index = pd.DatetimeIndex(index)
-    syms = [_Sym(s, d, strategy, index, funding.get(s), funding_fallback) for s, d in data.items()]
+    btc_key = next((k for k in data if k.upper().startswith("BTC/")), None)
+    btc_df = data[btc_key] if (btc_key and getattr(strategy, "uses_btc", False)) else None
+    syms = [_Sym(s, d, strategy, index, funding.get(s), funding_fallback,
+                 None if s == btc_key else btc_df) for s, d in data.items()]
 
     max_pos = risk.c.get("max_open_positions", 1)
     max_margin = risk.c.get("max_total_margin_pct", 1.0)
+    use_limit = entry_order == "limit"
 
     cash = float(initial)
     pos: dict[str, Trade] = {}
@@ -175,7 +221,8 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
     baseline = initial
     day, day_start_eq = None, initial
     pend_exit: set[str] = set()
-    pend_entry: dict[str, int] = {}
+    pend_entry: dict[str, dict] = {}     # coin -> {side, limit, expires, atr}
+    stats = {"limit_placed": 0, "limit_filled": 0}
 
     def px_of(s: _Sym, i: int, arr) -> float:
         v = arr[i]
@@ -190,27 +237,28 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
                 tot += t.side * (p - t.entry_price) * t.qty
         return tot
 
-    def close_pos(s: _Sym, i: int, raw: float, reason: str) -> None:
+    def close_pos(s: _Sym, i: int, raw: float, reason: str, maker: bool = False) -> None:
         nonlocal cash
         t = pos.pop(s.name)
-        px = raw * (1 - t.side * slippage)
-        t.exit_fee = px * t.qty * fee_rate
+        px = raw if maker else raw * (1 - t.side * slippage)
+        t.exit_fee = px * t.qty * (maker_fee if maker else taker_fee)
         t.exit_time, t.exit_price, t.reason = index[i], px, reason
         cash += t.pnl + t.entry_fee + t.funding     # giriş ücreti ve funding zaten düşülmüştü
         trades.append(t)
 
-    def open_pos(s: _Sym, i: int, side: int) -> None:
+    def open_pos(s: _Sym, i: int, side: int, px: float, atr: float, maker: bool) -> None:
         nonlocal cash
         used = sum(t.margin for t in pos.values())
         eq_now = cash + unreal(i, "o")
         room = max(0.0, eq_now * max_margin - used)
         available = min(cash - used, room)
-        plan = risk.plan_entry(eq_now, available, s.o[i], side, s.atr[i - 1])
+        plan = risk.plan_entry(eq_now, available, px, side, atr)
         if not plan:
             return
-        px = s.o[i] * (1 + side * slippage)
-        stop, tp = risk.protection_prices(px, side, s.atr[i - 1])
-        fee = px * plan.qty * fee_rate
+        if not maker:
+            px = px * (1 + side * slippage)
+        stop, tp = risk.protection_prices(px, side, atr)
+        fee = px * plan.qty * (maker_fee if maker else taker_fee)
         cash -= fee
         pos[s.name] = Trade(s.name, side, index[i], px, plan.qty, plan.margin, stop, tp, fee)
 
@@ -231,17 +279,37 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
             # 2) önceki mumun çıkış kararı
             if t and s.name in pend_exit:
                 close_pos(s, i, s.o[i], "sinyal")
+        pend_exit.clear()
 
         # 2b) girişler (öncelik sırası = config sırası)
-        if pend_entry and not risk.daily_limit_hit(day_start_eq, cash + unreal(i, "o")):
+        if pend_entry:
+            blocked = risk.daily_limit_hit(day_start_eq, cash + unreal(i, "o"))
             for s in syms:
-                side = pend_entry.get(s.name)
-                if side and s.name not in pos and len(pos) < max_pos and not np.isnan(s.o[i]):
-                    open_pos(s, i, side)
-        pend_exit.clear()
-        pend_entry.clear()
+                pe = pend_entry.get(s.name)
+                if not pe or np.isnan(s.o[i]):
+                    continue
+                if s.name in pos or blocked or len(pos) >= max_pos:
+                    if not use_limit or s.name in pos or i >= pe["expires"]:
+                        pend_entry.pop(s.name, None)
+                    continue
+                side = pe["side"]
+                if not use_limit:
+                    open_pos(s, i, side, s.o[i], pe["atr"], maker=False)
+                    pend_entry.pop(s.name, None)
+                    continue
+                lim = pe["limit"]
+                crossed = s.l[i] < lim if side == LONG else s.h[i] > lim
+                if crossed:
+                    fill = min(s.o[i], lim) if side == LONG else max(s.o[i], lim)
+                    open_pos(s, i, side, fill, pe["atr"], maker=True)
+                    if s.name in pos:
+                        stats["limit_filled"] += 1
+                    pend_entry.pop(s.name, None)
+                elif i >= pe["expires"]:
+                    pend_entry.pop(s.name, None)    # dolmadı -> iptal
 
         # 3) mum içi stop-loss / kâr al
+        tp_maker = tp_order == "limit"
         for s in syms:
             t = pos.get(s.name)
             if not t or np.isnan(s.o[i]):
@@ -251,12 +319,12 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
                 if l <= t.stop:
                     close_pos(s, i, min(o, t.stop), "stop-loss")
                 elif t.take_profit and h >= t.take_profit:
-                    close_pos(s, i, max(o, t.take_profit), "kâr-al")
+                    close_pos(s, i, max(o, t.take_profit), "kâr-al", maker=tp_maker)
             else:
                 if h >= t.stop:
                     close_pos(s, i, max(o, t.stop), "stop-loss")
                 elif t.take_profit and l <= t.take_profit:
-                    close_pos(s, i, min(o, t.take_profit), "kâr-al")
+                    close_pos(s, i, min(o, t.take_profit), "kâr-al", maker=tp_maker)
 
         for s in syms:
             if not np.isnan(s.c[i]):
@@ -268,6 +336,7 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
             for s in syms:
                 if s.name in pos:
                     close_pos(s, i, s.last_close, "devre kesici")
+            pend_entry.clear()
             breaker.append({"time": index[i], "baseline": round(baseline, 2), "equity": round(cash, 2)})
             baseline = cash
             eq_close = cash
@@ -282,10 +351,12 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
                 pend_exit.add(s.name)
             if t and not exiting:
                 continue
-            if s.le[i]:
-                pend_entry[s.name] = LONG
-            elif s.se[i] and allow_short:
-                pend_entry[s.name] = -1
+            side = LONG if s.le[i] else (-1 if (s.se[i] and allow_short) else 0)
+            if side:
+                limit = s.c[i] - side * limit_offset_atr * s.atr[i]
+                pend_entry[s.name] = {"side": side, "limit": limit, "atr": s.atr[i],
+                                      "expires": i + max(1, int(limit_ttl_bars))}
+                stats["limit_placed"] += 1 if use_limit else 0
 
         equity[i] = eq_close
 
@@ -300,4 +371,7 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
         valid = s.c[~np.isnan(s.c)]
         if len(valid) and not np.isnan(s.o[w]):
             bh[s.name] = valid[-1] / s.o[w] - 1
-    return BacktestResult(pd.Series(equity, index=index), trades, breaker, initial, bh, bars_per_year)
+    closes = pd.DataFrame({s.name: s.c for s in syms}, index=index)
+    res = BacktestResult(pd.Series(equity, index=index), trades, breaker, initial, bh, bars_per_year, closes)
+    res.limit_stats = stats
+    return res

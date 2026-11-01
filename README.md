@@ -1,4 +1,4 @@
-# Finans İşlem Botu (Binance Futures, v0.4)
+# Finans İşlem Botu (Binance Futures, v0.6)
 
 Binance **global USDⓈ-M Futures** üzerinde, **isolated marjin** ve düşük kaldıraçla (varsayılan 2x)
 **long ve short** yönlü, **10 coin** üzerinde otomatik işlem yapan bot:
@@ -24,12 +24,73 @@ python -m pytest -q                # testler (internet gerekmez)
 |---|---|
 | `python main.py backtest` | 10 coinin futures verisini (mum + funding) indirir, ortak bakiyeyle portföy testi yapar + coin bazında tablo |
 | `python main.py backtest --compare` | Ayar varyasyonlarını yan yana karşılaştırır |
+| `python main.py layers` | Her indikatör katmanının katkısını eğitim ve test dönemi için ayrı ayrı gösterir |
+| `python main.py layers --tf 4h` | Aynı katman testini 4 saatlik mumlarla yapar |
 | `python main.py backtest --refresh` | Veriyi yeniden indirir |
+| `python main.py collect` | Open interest ve long/short oranlarını indirip `data/metrics/` altında biriktirir |
+| `python main.py collect --archive 365` | (deneysel) Binance veri arşivinden geçmişi doldurmayı dener |
 | `python main.py info` | Her coinin borsa limitleri ve mevcut ayarlarla gereken **minimum sermaye** |
 | `python main.py run` | `config.yaml`'daki moda göre botu başlatır |
 | `python main.py status` | Bot bakiyesi, devre kesici seviyesi, açık pozisyon, son işlemler |
 | `python main.py report` | Ara rapor üretir (`reports/` klasörüne) |
 | `python main.py resume` | Devre kesiciyle duran botu yeniden etkinleştirir |
+
+## Strateji: çok katmanlı karar sistemi (`strategy.name: multi_factor`)
+
+Bir işlem açılması için açık olan **tüm** katmanların onay vermesi gerekir:
+
+| Katman | Gösterge | Kural | Varsayılan |
+|---|---|---|---|
+| 1. Piyasa rejimi | ADX (4s) | ADX ≥ 20 değilse piyasa yatay sayılır, işlem açılmaz | **açık** |
+| 2. Yön | EMA21 / EMA55 (4s) | Fiyat > EMA21 > EMA55 → sadece LONG; tersi → sadece SHORT | **açık** |
+| 3. BTC filtresi | BTC'nin 4s yönü | BTC düşüşteyken altcoinde LONG, yükselişteyken SHORT yok | **açık** |
+| Giriş | SMA20 / SMA50 (1s) | Kesişim, yukarıdaki filtreler onaylıyorsa işleme dönüşür | `trigger: cross` |
+| (4) Geri çekilme | RSI (1s) | Trend yönünde RSI geri çekilip toparlanınca gir | kapalı (`trigger: pullback`) |
+| (5) Momentum | MACD histogramı | Giriş yönüne dönmüş olmalı | kapalı |
+| (6) Yapı | Fibonacci | Geri çekilme son salınımın 0.382–0.786 bölgesinde olmalı | kapalı |
+| (7) Onay | Hacim | Son mumun hacmi 20 mumluk ortalamanın üstünde | kapalı |
+| 5. Funding | Funding rate | Funding aşırı pozitifken LONG, aşırı negatifken SHORT açılmaz (kalabalığa katılmama) | **açık** |
+| (T) Akış | Taker alış / toplam hacim | Son 6 mumda agresif alıcı/satıcı payı giriş yönünü desteklemeli | kapalı* |
+
+\* Alıcı/satıcı hacmi için mum verisinin yeniden indirilmesi gerekir: `python main.py backtest --refresh`
+
+Çıkış: borsadaki stop-loss / kâr-al, ya da ters kesişim sinyali.
+
+Kapalı katmanlar 1 yıllık veride (Kas 2025 – Kas 2026, 10 coin) eğitim döneminde katkı sağlamadı ve
+test döneminde sonucu kötüleştirdi. Kodda duruyorlar; `config.yaml`'dan açılıp `python main.py layers` ile
+yeniden değerlendirilebilirler. Katman eklerken kural: **karar eğitim dönemine göre verilir**, test dönemi
+yalnızca en sonda doğrulama içindir.
+
+Backtest notu: Eğitim/test dönemleri tek bir simülasyondan kesilir; böylece test dönemi başında
+göstergeler (ör. 4s EMA55, ADX) önceki veriyle ısınmış olur.
+
+## Emir tipleri ve ücretler (config.yaml → execution)
+
+Binance normal kullanıcı ücretleri: limit emir (maker) %0.02, piyasa emri (taker) %0.05.
+
+| Emir | Varsayılan | Açıklama |
+|---|---|---|
+| Giriş | **limit (post-only)** | Sinyal mumunun kapanış fiyatına konur; sadece maker olarak dolabilir. `limit_ttl_bars` mum içinde dolmazsa iptal edilir |
+| Kâr-al | **limit** | Deftere yazılı reduce-only limit emir (maker, kaymasız) |
+| Stop-loss | piyasa (stop-market) | Her zaman garantili çıkış için piyasa emri |
+| Sinyal / devre kesici çıkışı | piyasa | |
+
+Backtest, limit emri sadece fiyat limit seviyesini **geçerse** dolu sayar (dokunması yetmez), böylece kuyruk
+önceliği ve "fiyat kaçınca dolmama" etkisi hesaba katılır. 1 yıllık veride emirlerin ~%82'si doldu.
+
+## Open interest ve long/short verisi
+
+Binance bu verileri API'de **yalnızca son 30 gün** için verir. `python main.py collect` her coin için
+open interest, büyük trader'ların long/short oranları, tüm hesapların long/short oranı ve taker alış/satış
+oranını `data/metrics/` altına ekler. `python main.py run` çalışırken bu toplama günde bir kez otomatik yapılır.
+Bot sürekli çalışmıyorsa `collect`'i en az 3 haftada bir çalıştırın; Windows Görev Zamanlayıcı ile
+otomatikleştirmek için (klasör yolunu kendi yolunuzla değiştirin):
+
+```
+schtasks /create /tn "trading_bot_collect" /sc daily /st 09:00 /tr "cmd /c cd /d C:\Users\emiry\Documents\trading_bot && .venv\Scripts\python.exe main.py collect"
+```
+
+Bu veriler birkaç ay birikince stratejiye yeni katman olarak eklenip test edilecek.
 
 ## Risk kuralları (config.yaml → risk)
 
@@ -102,6 +163,6 @@ tests/           birim testleri (internet gerekmez)
 
 - Paper modunda funding simüle edilmez ve stop/kâr-al kontrolü her turda (poll_seconds) yapılır.
 - Borsa ücreti BNB ile ödenirse live K/Z'de ücret kısmı eksik görünebilir (realizedPnl doğrudur).
-- Örnek strateji (SMA kesişimi + RSI) gerçek BTC verisinde henüz kârlı değil; strateji geliştirme sürüyor.
+- Strateji 1 yıllık veride henüz kârlı değil (kâr faktörü ~0.96); canlıya alınmamalı. Strateji geliştirme sürüyor.
 - Sabit %2.5 fiyat stop'u (ROE %5 / 2x), HYPE ve ZEC gibi oynak coinlerde daha sık tetiklenir.
   Coin bazında tablo bunu gösterir; gerekirse `stop_mode: atr` dene.

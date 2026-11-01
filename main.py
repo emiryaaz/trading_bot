@@ -3,6 +3,10 @@
     python main.py backtest              # 10 coin, Binance Futures geçmiş verisiyle portföy testi (+ coin bazında)
     python main.py backtest --compare    # ayar varyasyonlarını karşılaştır (ROE vs ATR, long+short vs long)
     python main.py backtest --synthetic  # internet olmadan, sahte veriyle (sadece kod testi)
+    python main.py layers               # her indikatör katmanının katkısı (eğitim / test ayrı)
+    python main.py layers --tf 4h       # aynı test 4 saatlik mumlarla
+    python main.py collect              # open interest + long/short oranlarını topla (son 30 gün)
+    python main.py collect --archive 365  # + arşivden geçmişi doldurmayı dene
     python main.py info                  # her coinin borsa limitleri ve gereken minimum sermaye
     python main.py run                   # config.yaml'daki moda göre botu başlat (paper/testnet/live)
     python main.py status                # durum, açık pozisyon ve son işlemler
@@ -18,19 +22,17 @@ import json
 import pandas as pd
 
 from bot.backtest import run_backtest
-from bot.config import ROOT, futures_symbol, load_config
+from bot.config import ROOT, backtest_kwargs, futures_symbol, load_config
 from bot.data import TF_MINUTES, load_history, synthetic_portfolio
 from bot.risk import RiskManager
 from bot.strategy import build_strategy
 
 
-def _bt(cfg, df, funding):
-    ex, fut = cfg["exchange"], cfg["futures"]
-    return run_backtest(df, build_strategy(cfg), RiskManager(cfg["risk"], fut["leverage"]),
-                        cfg["backtest"]["initial_balance"], ex["fee_rate"], ex["slippage"],
-                        allow_short=fut["allow_short"], funding=funding,
-                        funding_fallback=fut["funding_rate_fallback"],
-                        bars_per_year=525600 / TF_MINUTES[ex["timeframe"]])
+def _bt(cfg, df, funding, strategy=None, tf=None):
+    kw = backtest_kwargs(cfg)
+    return run_backtest(df, strategy or build_strategy(cfg), RiskManager(cfg["risk"], cfg["futures"]["leverage"]),
+                        cfg["backtest"]["initial_balance"], kw.pop("fee_rate"), kw.pop("slippage"),
+                        funding=funding, bars_per_year=525600 / TF_MINUTES[tf or cfg["exchange"]["timeframe"]], **kw)
 
 
 def _print(name, res):
@@ -74,20 +76,19 @@ def cmd_backtest(cfg, synthetic, refresh, split, compare):
         variants = {
             "Mevcut ayarlar": {},
             "Sadece long": {"futures": {"allow_short": False}},
-            "ATR stop (2x / 4x ATR)": {"risk": {"stop_mode": "atr"}},
+            "ATR stop 2x/4x (risk %1)": {"risk": {"stop_mode": "atr", "risk_per_trade_pct": 0.01}},
             "ROE %5 stop, %10 kâr-al": {"risk": {"take_profit_roe": 0.10}},
             "En fazla 1 pozisyon": {"risk": {"max_open_positions": 1}},
             "En fazla 5 pozisyon": {"risk": {"max_open_positions": 5, "max_total_margin_pct": 1.0}},
-            "4 saatlik mumlar": {"exchange": {"timeframe": "4h"}},
         }
         rows = []
         for name, over in variants.items():
             c = copy.deepcopy(cfg)
             for sec, vals in over.items():
                 c[sec].update(vals)
-            d = data if c["exchange"]["timeframe"] == ex["timeframe"] else _resample(data, c["exchange"]["timeframe"])
-            m_all = _bt(c, d, funding).metrics()
-            m_test = _bt(c, _slice(d, cut_time), funding).metrics() if split else m_all
+            res = _bt(c, data, funding)
+            m_all = res.metrics()
+            m_test = res.subset(cut_time).metrics() if split else m_all
             rows.append({"Varyasyon": name, "Getiri %": m_all["Toplam getiri %"],
                          "Maks DD %": m_all["Maks. düşüş (drawdown) %"],
                          "İşlem": m_all["İşlem sayısı (long/short)"], "Kazanma %": m_all["Kazanma oranı %"],
@@ -98,14 +99,14 @@ def cmd_backtest(cfg, synthetic, refresh, split, compare):
         print("\n" + pd.DataFrame(rows).set_index("Varyasyon").to_string())
         return
 
-    parts = [("Tüm veri", data)]
+    # Tek simülasyon tüm veride; eğitim / test dönemleri bu simülasyondan kesilir
+    # (göstergeler önceki veriyle ısınmış olur — test dönemi "soğuk" başlamaz).
+    res_all = _bt(cfg, data, funding)
+    parts = [("Tüm veri", res_all)]
     if split:
-        parts += [(f"Eğitim (ilk %{split * 100:.0f})", _slice(data, None, cut_time)),
-                  (f"Test (son %{(1 - split) * 100:.0f})", _slice(data, cut_time))]
-    res_all = None
-    for name, part in parts:
-        res = _bt(cfg, part, funding)
-        res_all = res_all or res
+        parts += [(f"Eğitim (ilk %{split * 100:.0f}, {idx[0]:%Y-%m-%d} → {cut_time:%Y-%m-%d})", res_all.subset(None, cut_time)),
+                  (f"Test (son %{(1 - split) * 100:.0f}, {cut_time:%Y-%m-%d} →)", res_all.subset(cut_time))]
+    for name, res in parts:
         _print(name, res)
         for ev in res.breaker_events[:5]:
             print(f"    devre kesici: {ev['time']}  {ev['baseline']} → {ev['equity']}")
@@ -118,6 +119,70 @@ def cmd_backtest(cfg, synthetic, refresh, split, compare):
     out.parent.mkdir(exist_ok=True)
     pd.DataFrame([t.as_dict() for t in res_all.trades]).to_csv(out, index=False)
     print(f"\nİşlem listesi (tüm veri): {out}")
+
+
+LAYER_OFF = dict(use_regime=False, use_htf=False, use_btc_filter=False, trigger="cross",
+                 use_macd=False, use_fib=False, use_volume=False)
+
+
+def cmd_layers(cfg, split, tf):
+    """Her katmanın katkısını ayrı ayrı ölçer. Kararlar EĞİTİM dönemine göre verilmeli; TEST dönemi
+    yalnızca en sonda doğrulama içindir (test sonucuna bakıp ayar değiştirmek ezberlemeye yol açar)."""
+    from bot import indicators as ind
+    data, funding = load_history(cfg)
+    base_tf = cfg["exchange"]["timeframe"]
+    if tf and tf != base_tf:
+        data = {k: ind.resample_ohlcv(d, tf) for k, d in data.items()}
+    tf = tf or base_tf
+    htf = {"1h": {"htf": "4h"}, "4h": {"htf": "1D", "htf_fast": 10, "htf_slow": 30, "fib_lookback": 30,
+                                         "pull_window": 6}}.get(tf, {})
+    idx = sorted(set().union(*[d.index for d in data.values()]))
+    cut = idx[int(len(idx) * split)]
+    ex = cfg["exchange"]
+    print(f"{len(data)} coin, {tf} mumlar | eğitim: {idx[0]:%Y-%m-%d} → {cut:%Y-%m-%d} | test: {cut:%Y-%m-%d} → {idx[-1]:%Y-%m-%d}")
+    print(f"Çıkış kuralı (config): stop {cfg['risk']['stop_mode']}\n")
+    on = lambda **kw: {**LAYER_OFF, **htf, **kw}
+    L3 = dict(use_regime=True, use_htf=True, use_btc_filter=True)
+    MKT = {"entry_order": "market", "tp_order": "market"}          # sinyal katmanları piyasa emriyle ölçülür
+    LIM = {"entry_order": "limit", "tp_order": "limit"}
+    has_taker = all("taker_buy_volume" in d for d in data.values())
+    stages = [
+        ("0 Eski: SMA kesişimi", "sma_cross_rsi", {"fast": 20, "slow": 50, "rsi_period": 14, "rsi_max_entry": 70,
+                                                    "rsi_min_entry": 30, "atr_period": 14}, MKT),
+        ("1 + Rejim (ADX)", "multi_factor", on(use_regime=True), MKT),
+        ("2 + Üst zaman dilimi yönü", "multi_factor", on(use_regime=True, use_htf=True), MKT),
+        ("3 + BTC filtresi", "multi_factor", on(**L3), MKT),
+        ("4 Giriş: geri çekilme (RSI)", "multi_factor", on(**L3, trigger="pullback"), MKT),
+        ("5 + MACD", "multi_factor", on(**L3, trigger="pullback", use_macd=True), MKT),
+        ("6 + Fibonacci", "multi_factor", on(**L3, trigger="pullback", use_macd=True, use_fib=True), MKT),
+        ("7 + Hacim", "multi_factor", on(**L3, trigger="pullback", use_macd=True, use_fib=True, use_volume=True), MKT),
+        ("F  1-3 + Funding filtresi", "multi_factor", on(**L3, use_funding=True), MKT),
+    ]
+    if has_taker:
+        stages.append(("T  1-3 + Alıcı/satıcı baskısı", "multi_factor", on(**L3, use_taker_flow=True), MKT))
+    else:
+        print("Not: mum verisinde alıcı/satıcı (taker) hacmi yok → 'T' katmanı atlandı. "
+              "Eklemek için bir kez: python main.py backtest --refresh\n")
+    stages += [
+        ("L  1-3 + Limit giriş ve kâr-al", "multi_factor", on(**L3), LIM),
+        ("LF 1-3 + Funding + Limit", "multi_factor", on(**L3, use_funding=True), LIM),
+    ]
+    from bot.strategy import STRATEGIES
+    rows = []
+    for name, strat, params, exec_over in stages:
+        c = copy.deepcopy(cfg)
+        c["execution"].update(exec_over)
+        res = _bt(c, data, funding, STRATEGIES[strat](**params), tf)
+        tr, te = res.subset(None, cut).metrics(), res.subset(cut).metrics()
+        rows.append({"Aşama": name, "Eğitim getiri %": tr["Toplam getiri %"], "Eğitim DD %": tr["Maks. düşüş (drawdown) %"],
+                     "Eğitim işlem": tr["İşlem sayısı (long/short)"].split()[0], "Eğitim KF": tr["Kâr faktörü"],
+                     "| Test getiri %": te["Toplam getiri %"], "Test işlem": te["İşlem sayısı (long/short)"].split()[0],
+                     "Test KF": te["Kâr faktörü"]})
+        print(f"  {name} tamam", flush=True)
+    pd.set_option("display.width", 220)
+    print("\n" + pd.DataFrame(rows).set_index("Aşama").to_string())
+    print("\nNot: KF = kâr faktörü (kazanç / kayıp). 1'in üstü kârlı. 30'dan az işlemle verilen sonuçlar güvenilir değildir.")
+    print("0-7, F ve T satırları piyasa emriyle; L satırları limit giriş + limit kâr-al ile ölçülür.")
 
 
 def _trader(cfg):
@@ -138,6 +203,23 @@ def cmd_run(cfg):
             print("İptal edildi.")
             return
     _trader(cfg).run()
+
+
+def cmd_collect(cfg, archive_days):
+    from bot.collector import METRICS_DIR, backfill_archive, collect_recent
+    print(f"Open interest ve long/short oranları toplanıyor → {METRICS_DIR}")
+    summary = collect_recent(cfg)
+    rows = {}
+    for (coin, metric), v in summary.items():
+        rows.setdefault(coin, {})[metric] = v
+    pd.set_option("display.width", 220)
+    print("\nEklenen yeni satır sayısı (1 saatlik kayıt):")
+    print(pd.DataFrame(rows).T.to_string())
+    if archive_days:
+        print(f"\nArşivden son {archive_days} gün deneniyor (data.binance.vision)...")
+        backfill_archive(cfg, archive_days)
+    print("\nNot: Binance bu veriyi sadece son 30 gün için veriyor. Bot sürekli çalışmıyorsa bu komutu "
+          "en az 3 haftada bir çalıştırın.")
 
 
 def cmd_info(cfg):
@@ -211,15 +293,19 @@ def cmd_resume(cfg):
 
 def main():
     ap = argparse.ArgumentParser(description="Finans İşlem Botu (Binance Futures)")
-    ap.add_argument("command", choices=["backtest", "info", "run", "status", "report", "resume"])
+    ap.add_argument("command", choices=["backtest", "layers", "collect", "info", "run", "status", "report", "resume"])
     ap.add_argument("--config", default=None)
     ap.add_argument("--synthetic", action="store_true", help="sahte veriyle backtest")
     ap.add_argument("--refresh", action="store_true", help="geçmiş veriyi yeniden indir")
     ap.add_argument("--compare", action="store_true", help="ayar varyasyonlarını karşılaştır")
     ap.add_argument("--split", type=float, default=0.7, help="eğitim/test ayrımı (0 = ayırma)")
+    ap.add_argument("--tf", default=None, help="layers için zaman dilimi (ör. 4h; 1s veriden üretilir)")
+    ap.add_argument("--archive", type=int, default=0, help="collect: arşivden kaç günlük geçmiş denensin")
     a = ap.parse_args()
     cfg = load_config(a.config)
     {"backtest": lambda: cmd_backtest(cfg, a.synthetic, a.refresh, a.split, a.compare),
+     "layers": lambda: cmd_layers(cfg, a.split or 0.7, a.tf),
+     "collect": lambda: cmd_collect(cfg, a.archive),
      "info": lambda: cmd_info(cfg), "run": lambda: cmd_run(cfg), "status": lambda: cmd_status(cfg),
      "report": lambda: cmd_report(cfg), "resume": lambda: cmd_resume(cfg)}[a.command]()
 

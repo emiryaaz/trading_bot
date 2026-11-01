@@ -326,3 +326,300 @@ def test_closed_result_from_exchange():
     assert r.fees == pytest.approx(0.49375)
     assert r.funding == pytest.approx(-0.05)
     assert r.pnl == pytest.approx(12.5 - 0.49375 + 0.05)
+
+
+# ------------------------------------------------------------------ çok katmanlı strateji (v0.5)
+from bot.strategy import MultiFactor
+
+
+def test_multifactor_no_lookahead():
+    df = synthetic_ohlcv(n=1500, seed=5)
+    btc = synthetic_ohlcv(n=1500, seed=6)
+    s = MultiFactor()
+    cut = 1100
+    a = s.generate(df.iloc[:cut], btc.iloc[:cut])
+    df2, btc2 = df.copy(), btc.copy()
+    df2.iloc[cut:, :4] *= 1.7
+    btc2.iloc[cut:, :4] *= 0.5
+    b = s.generate(df2, btc2).iloc[:cut]
+    for col in ("long_entry", "short_entry", "long_exit", "short_exit", "dir"):
+        assert (a[col].values == b[col].values).all(), col
+
+
+def test_multifactor_direction_rules():
+    df = synthetic_ohlcv(n=4000, seed=7)
+    out = MultiFactor(use_btc_filter=False).generate(df)
+    assert out["long_entry"].sum() > 0 and out["short_entry"].sum() > 0
+    assert (out.loc[out["long_entry"], "dir"] == 1).all()        # LONG yalnızca yükselen trendde
+    assert (out.loc[out["short_entry"], "dir"] == -1).all()      # SHORT yalnızca düşen trendde
+    assert (out.loc[out["long_entry"] | out["short_entry"], "adx"] >= 20).all()
+    assert not (out["long_entry"] & out["short_entry"]).any()
+
+
+def test_multifactor_btc_filter():
+    df = synthetic_ohlcv(n=4000, seed=7)
+    btc = synthetic_ohlcv(n=4000, seed=8)
+    out = MultiFactor().generate(df, btc)
+    assert (out.loc[out["long_entry"], "btc_dir"] != -1).all()   # BTC düşerken altcoinde long yok
+    assert (out.loc[out["short_entry"], "btc_dir"] != 1).all()
+    free = MultiFactor(use_btc_filter=False).generate(df)
+    assert (out["long_entry"] | out["short_entry"]).sum() <= (free["long_entry"] | free["short_entry"]).sum()
+
+
+def test_layers_reduce_trades():
+    data = synthetic_portfolio(COINS, n=3000)
+    off = dict(use_regime=False, use_htf=False, use_btc_filter=False, trigger="cross",
+               use_macd=False, use_fib=False, use_volume=False)
+    s_off = run_backtest(data, MultiFactor(**off), RiskManager(RISK, LEV), 1000, 0.0005, 0.0003)
+    s_all = run_backtest(data, MultiFactor(), RiskManager(RISK, LEV), 1000, 0.0005, 0.0003)
+    assert 0 < len(s_all.trades) < len(s_off.trades)
+
+
+def test_atr_risk_sizing():
+    risk = {**RISK, "stop_mode": "atr", "stop_atr_mult": 2.0, "take_profit_atr_mult": 4.0, "risk_per_trade_pct": 0.01}
+    rm = RiskManager(risk, LEV)
+    p = rm.plan_entry(equity=1000, available=1000, price=100, side=LONG, atr=2.0)   # stop 96
+    assert p.stop == pytest.approx(96) and p.take_profit == pytest.approx(108)
+    assert (100 - p.stop) * p.qty == pytest.approx(10)          # kayıp = bakiyenin %1'i (teminat 125)
+    wide = rm.plan_entry(equity=1000, available=1000, price=100, side=LONG, atr=0.1)  # çok dar stop
+    assert wide.margin <= 1000 * 0.20 + 1e-9                     # teminat tavanı aşılmaz
+
+
+def test_subset_uses_warm_indicators():
+    data = synthetic_portfolio(COINS[:3], n=3000)
+    res = run_backtest(data, MultiFactor(), RiskManager(RISK, LEV), 1000, 0.0005, 0.0003)
+    cut = res.equity.index[2100]
+    tr, te = res.subset(None, cut), res.subset(cut)
+    assert len(tr.trades) + len(te.trades) == len(res.trades)
+    assert te.initial == pytest.approx(float(res.equity.loc[:cut].iloc[-2]))
+    assert set(te.buy_hold) == set(COINS[:3])
+
+
+def test_trader_multifactor_with_btc_context(tmp_path):
+    coins = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    src = FakeSource(synthetic_portfolio(coins, n=2600))
+    paper = PaperFutures(src, 1000, 0.0005, 0.0003, LEV)
+    cfg = _cfg(tmp_path, coins=coins)
+    t = Trader(cfg, paper, MultiFactor(adx_min=15), RiskManager(RISK, LEV), state_path=tmp_path / "state.json")
+    src.i = 1700
+    for i in range(src.i, 2599):
+        src.i = i
+        assert t.step()
+    assert len(t.state["trades"]) > 0
+    assert len(paper.pos) == len(t.positions)
+
+
+# ------------------------------------------------------------------ v0.6: limit emir, ücretler, yeni veriler
+from bot.strategy import Strategy as _BaseStrategy
+
+
+class _OneShot(_BaseStrategy):
+    """Belirli mumda LONG sinyali veren deneme stratejisi."""
+
+    def __init__(self, at):
+        super().__init__()
+        self.at = at
+
+    @property
+    def warmup(self):
+        return 1
+
+    def generate(self, df, btc=None):
+        out = df.copy()
+        out["atr"] = 1.0
+        for c in ("long_entry", "short_entry", "long_exit", "short_exit"):
+            out[c] = False
+        out.iloc[self.at, out.columns.get_loc("long_entry")] = True
+        return out
+
+
+def _bars(rows):
+    idx = pd.date_range("2025-01-01", periods=len(rows), freq="1h", tz="UTC")
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close"], index=idx).assign(volume=1.0)
+
+
+RISK_NO_TP = {**RISK, "take_profit_roe": 0}
+
+
+def test_limit_entry_fills_only_when_price_crosses():
+    # sinyal mumu 1 (kapanış 100). Mum 2'nin dibi 99.5 < 100 -> dolar, maker ücreti, kaymasız.
+    df = _bars([(100, 101, 99, 100), (100, 101, 99, 100), (100.5, 101, 99.5, 100.8), (100.8, 101, 100, 100.5)])
+    res = run_backtest(df, _OneShot(1), RiskManager(RISK_NO_TP, LEV), 1000, 0.0005, 0.0003,
+                       maker_fee=0.0002, entry_order="limit")
+    t = res.trades[0]
+    assert t.entry_price == pytest.approx(100.0)
+    assert t.entry_fee == pytest.approx(t.qty * 100 * 0.0002)
+    # dibi tam 100'e DOKUNUP geçmeyen mum -> dolmaz (kuyruk önceliği temkini)
+    df2 = _bars([(100, 101, 99, 100), (100, 101, 99, 100), (100.5, 101, 100.0, 100.8), (100.8, 101, 100.2, 100.5)])
+    res2 = run_backtest(df2, _OneShot(1), RiskManager(RISK_NO_TP, LEV), 1000, 0.0005, 0.0003,
+                        maker_fee=0.0002, entry_order="limit")
+    assert res2.trades == [] and res2.limit_stats == {"limit_placed": 1, "limit_filled": 0}
+    # aynı senaryo piyasa emriyle: mum 2 açılışından + kayma, taker ücreti
+    res3 = run_backtest(df2, _OneShot(1), RiskManager(RISK_NO_TP, LEV), 1000, 0.0005, 0.0003,
+                        maker_fee=0.0002, entry_order="market")
+    t3 = res3.trades[0]
+    assert t3.entry_price == pytest.approx(100.5 * 1.0003)
+    assert t3.entry_fee == pytest.approx(t3.qty * t3.entry_price * 0.0005)
+
+
+def test_limit_gap_fills_at_better_open():
+    df = _bars([(100, 101, 99, 100), (100, 101, 99, 100), (99.0, 99.5, 98.8, 99.2), (99.2, 99.5, 99, 99.3)])
+    res = run_backtest(df, _OneShot(1), RiskManager(RISK_NO_TP, LEV), 1000, 0.0005, 0.0003,
+                       maker_fee=0.0002, entry_order="limit")
+    assert res.trades[0].entry_price == pytest.approx(99.0)        # açılış limitten iyiyse açılıştan
+
+
+def test_take_profit_limit_is_maker():
+    risk = {**RISK, "take_profit_roe": 0.05}                         # 2x -> fiyatın %2.5'i
+    df = _bars([(100, 101, 99, 100), (100, 101, 99, 100), (100, 101, 99.5, 100.5), (100.5, 103.5, 100, 103)])
+    res = run_backtest(df, _OneShot(1), RiskManager(risk, LEV), 1000, 0.0005, 0.0003,
+                       maker_fee=0.0002, entry_order="limit", tp_order="limit")
+    t = res.trades[0]
+    assert t.reason == "kâr-al" and t.exit_price == pytest.approx(102.5)
+    assert t.exit_fee == pytest.approx(t.qty * 102.5 * 0.0002)
+
+
+def test_limit_vs_market_on_portfolio():
+    data = synthetic_portfolio(COINS, n=3000)
+    s = MultiFactor(use_btc_filter=True)
+    mk = run_backtest(data, s, RiskManager(RISK, LEV), 1000, 0.0005, 0.0003, maker_fee=0.0002)
+    lm = run_backtest(data, s, RiskManager(RISK, LEV), 1000, 0.0005, 0.0003, maker_fee=0.0002,
+                      entry_order="limit", tp_order="limit")
+    st = lm.limit_stats
+    assert 0 < st["limit_filled"] <= st["limit_placed"]
+    assert len(lm.trades) <= len(mk.trades)
+    fee_mk = sum(t.entry_fee for t in mk.trades) / max(1, len(mk.trades))
+    fee_lm = sum(t.entry_fee for t in lm.trades) / max(1, len(lm.trades))
+    assert fee_lm < fee_mk
+
+
+def test_funding_layer_blocks_crowded_side():
+    df = synthetic_ohlcv(n=4000, seed=7)
+    f = pd.Series(0.0001, index=df.index)
+    f.iloc[2000:2600] = 0.002                                         # aşırı pozitif funding: kalabalık long
+    df["funding_rate"] = f
+    on = MultiFactor(use_btc_filter=False, use_funding=True).generate(df)
+    off = MultiFactor(use_btc_filter=False).generate(df)
+    win = slice(2000, 2600)
+    assert on["long_entry"].iloc[win].sum() == 0
+    assert off["long_entry"].sum() >= on["long_entry"].sum()
+    assert on["short_entry"].iloc[win].sum() == off["short_entry"].iloc[win].sum()   # short engellenmez
+
+
+def test_taker_flow_layer():
+    df = synthetic_ohlcv(n=4000, seed=7)
+    df["taker_buy_volume"] = df["volume"] * 0.3                       # sürekli satıcı baskısı
+    out = MultiFactor(use_btc_filter=False, use_taker_flow=True).generate(df)
+    assert out["long_entry"].sum() == 0
+    df["taker_buy_volume"] = df["volume"] * 0.7                       # sürekli alıcı baskısı
+    out = MultiFactor(use_btc_filter=False, use_taker_flow=True).generate(df)
+    assert out["short_entry"].sum() == 0
+
+
+def test_attach_funding_no_lookahead():
+    from bot.backtest import attach_funding
+    df = synthetic_ohlcv(n=48)
+    f = pd.Series([0.001, 0.002], index=pd.DatetimeIndex(
+        ["2024-01-01 08:00:00.005", "2024-01-01 16:00:00.003"], tz="UTC"))
+    out = attach_funding(df, f)
+    assert pd.isna(out.loc["2024-01-01 07:00", "funding_rate"])
+    assert out.loc["2024-01-01 08:00", "funding_rate"] == 0.001
+    assert out.loc["2024-01-01 15:00", "funding_rate"] == 0.001
+    assert out.loc["2024-01-01 16:00", "funding_rate"] == 0.002
+
+
+def test_trader_limit_entries_paper(tmp_path):
+    src = FakeSource(synthetic_portfolio(COINS, n=1500))
+    paper = PaperFutures(src, 1000, 0.0005, 0.0003, LEV, maker_fee=0.0002, tp_limit=True)
+    cfg = _cfg(tmp_path)
+    cfg["execution"] = {"entry_order": "limit", "limit_offset_atr": 0.0, "limit_ttl_bars": 1, "tp_order": "limit"}
+    t = Trader(cfg, paper, SmaCrossRsi(**PARAMS), RiskManager(RISK, LEV), state_path=tmp_path / "state.json")
+    placed = 0
+    for i in range(200, 1499):
+        src.i = i
+        before = len(t.pending)
+        alive = t.step()
+        placed += max(0, len(t.pending) - before)
+        assert t.slots_used() <= 3
+        assert len(t.pending) <= 3
+        assert set(paper.pos) == set(t.positions)                     # bot ve hesap senkron
+        if not alive:                                                 # devre kesici durdurduysa
+            assert not t.pending and not t.positions
+            break
+    trades = t.state["trades"]
+    assert trades and placed > len(trades)                            # bazı limit emirler dolmadı
+    for x in trades:                                                  # giriş ücreti maker oranında
+        assert x["fees"] > 0
+    # yeniden başlatınca bekleyen emirler geri yüklenir
+    t2 = Trader(cfg, PaperFutures(src, 1000, 0.0005, 0.0003, LEV, maker_fee=0.0002, tp_limit=True),
+                SmaCrossRsi(**PARAMS), RiskManager(RISK, LEV), state_path=tmp_path / "state.json")
+    assert set(t2.pending) == set(t.pending) and set(t2.ex.orders) == set(paper.orders)
+
+
+def test_breaker_cancels_pending(tmp_path):
+    src = FakeSource(synthetic_portfolio(COINS, n=800))
+    paper = PaperFutures(src, 1000, 0.0005, 0.0003, LEV, maker_fee=0.0002)
+    cfg = _cfg(tmp_path)
+    cfg["execution"] = {"entry_order": "limit", "limit_ttl_bars": 3}
+    t = Trader(cfg, paper, SmaCrossRsi(**PARAMS), RiskManager(RISK, LEV), state_path=tmp_path / "s.json")
+    src.i = 300
+    oid = paper.place_limit_entry("ETH/USDT:USDT", LONG, 0.01, 1.0)   # dolmayacak kadar düşük fiyat
+    t.pending["ETH/USDT:USDT"] = {"id": oid, "side": LONG, "qty": 0.01, "price": 1.0, "atr": 1.0,
+                                  "margin": 0.005, "placed": "x", "placed_ms": 0, "candles": 0}
+    t._close_all("devre kesici")
+    assert not t.pending and not paper.orders
+
+
+# ------------------------------------------------------------------ veri toplayıcı
+class _FakeMetricsEx:
+    def __init__(self):
+        self.calls = 0
+        now = int(pd.Timestamp.now(tz="UTC").floor("h").timestamp() * 1000)
+        self.ts = [now - k * 3600_000 for k in range(5, 0, -1)]
+
+    def market(self, s):
+        return {"id": s.split(":")[0].replace("/", "")}
+
+    def _rows(self, params, fields):
+        self.calls += 1
+        return [{"timestamp": t, **{k: str(1 + j * 0.1) for j, k in enumerate(fields)}}
+                for t in self.ts if t >= params["startTime"]]
+
+    def fapiDataGetOpenInterestHist(self, p): return self._rows(p, ["sumOpenInterest", "sumOpenInterestValue"])
+    def fapiDataGetTopLongShortPositionRatio(self, p): return self._rows(p, ["longShortRatio", "longAccount", "shortAccount"])
+    def fapiDataGetTopLongShortAccountRatio(self, p): return self._rows(p, ["longShortRatio", "longAccount", "shortAccount"])
+    def fapiDataGetGlobalLongShortAccountRatio(self, p): return self._rows(p, ["longShortRatio", "longAccount", "shortAccount"])
+    def fapiDataGetTakerlongshortRatio(self, p): return self._rows(p, ["buySellRatio", "buyVol", "sellVol"])
+
+
+def test_collector_merges_without_duplicates(tmp_path, monkeypatch):
+    from bot import collector
+    monkeypatch.setattr(collector, "METRICS_DIR", tmp_path)
+    cfg = {"exchange": {"symbols": ["BTC/USDT", "ETH/USDT"]}}
+    ex = _FakeMetricsEx()
+    s1 = collector.collect_recent(cfg, ex)
+    assert s1[("BTC/USDT", "open_interest")] == 5
+    s2 = collector.collect_recent(cfg, ex)                            # tekrar: yeni kayıt yok
+    assert all(v == 0 for v in s2.values())
+    m = collector.load_metrics("BTC/USDT:USDT")
+    assert len(m) == 5 and "open_interest_oi" in m and "taker_ratio_ratio" in m
+
+
+def test_archive_parser():
+    import io, zipfile
+    from bot.collector import parse_archive_csv
+    csv = ("create_time,symbol,sum_open_interest,sum_open_interest_value,count_toptrader_long_short_ratio,"
+           "sum_toptrader_long_short_ratio,count_long_short_ratio,sum_taker_long_short_vol_ratio\n"
+           "2025-01-01 00:05:00,BTCUSDT,100,1000,1.1,1.2,0.9,1.05\n2025-01-01 00:10:00,BTCUSDT,101,1010,1.1,1.2,0.9,0.95\n")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("BTCUSDT-metrics-2025-01-01.csv", csv)
+    df = parse_archive_csv(buf.getvalue())
+    assert len(df) == 2 and df["sum_open_interest"].iloc[1] == 101 and "symbol" not in df
+
+
+def test_klines_parser_keeps_taker_volume():
+    from bot.exchange import klines_to_df
+    rows = [[1735689600000, "100", "101", "99", "100.5", "10", 1735693199999, "1000", 50, "6", "600", "0"]]
+    df = klines_to_df(rows)
+    assert df["taker_buy_volume"].iloc[0] == 6 and df["close"].iloc[0] == 100.5

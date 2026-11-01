@@ -23,8 +23,33 @@ def load_config(path: str | os.PathLike | None = None) -> dict:
         "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
     }
+    normalize(cfg)
     validate(cfg)
     return cfg
+
+
+def normalize(cfg: dict) -> dict:
+    """Eski ayar dosyalarıyla uyumluluk ve varsayılanlar."""
+    ex = cfg.setdefault("exchange", {})
+    if "taker_fee" not in ex:
+        ex["taker_fee"] = ex.get("fee_rate", 0.0005)
+    ex.setdefault("maker_fee", ex["taker_fee"])
+    ex["fee_rate"] = ex["taker_fee"]
+    exe = cfg.setdefault("execution", {})
+    exe.setdefault("entry_order", "market")
+    exe.setdefault("limit_offset_atr", 0.0)
+    exe.setdefault("limit_ttl_bars", 1)
+    exe.setdefault("tp_order", "market")
+    return cfg
+
+
+def backtest_kwargs(cfg: dict) -> dict:
+    """run_backtest'e config'den gelen ücret / emir tipi parametreleri."""
+    ex, exe, fut = cfg["exchange"], cfg["execution"], cfg["futures"]
+    return {"fee_rate": ex["taker_fee"], "maker_fee": ex["maker_fee"], "slippage": ex["slippage"],
+            "allow_short": fut["allow_short"], "funding_fallback": fut["funding_rate_fallback"],
+            "entry_order": exe["entry_order"], "limit_offset_atr": exe["limit_offset_atr"],
+            "limit_ttl_bars": exe["limit_ttl_bars"], "tp_order": exe["tp_order"]}
 
 
 def futures_symbol(symbol: str) -> str:
@@ -39,6 +64,14 @@ def validate(cfg: dict) -> None:
     mode = cfg.get("mode")
     if mode not in ("paper", "testnet", "live"):
         raise ValueError(f"Geçersiz mode: {mode!r} (paper / testnet / live olmalı)")
+
+    exe = cfg.get("execution", {})
+    if exe.get("entry_order", "market") not in ("market", "limit"):
+        raise ValueError("execution.entry_order 'market' veya 'limit' olmalı")
+    if exe.get("tp_order", "market") not in ("market", "limit"):
+        raise ValueError("execution.tp_order 'market' veya 'limit' olmalı")
+    if exe.get("limit_ttl_bars", 1) < 1:
+        raise ValueError("execution.limit_ttl_bars en az 1 olmalı")
 
     fut = cfg["futures"]
     if not 1 <= fut["leverage"] <= 5:

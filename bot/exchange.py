@@ -74,6 +74,20 @@ class FuturesClient(ABC):
     @abstractmethod
     def closed_result(self, symbol: str, side: int, since_ms: int, entry_fee: float) -> ClosedResult | None: ...
 
+    # --- limit (post-only) giriş emirleri
+    def place_limit_entry(self, symbol: str, side: int, qty: float, price: float) -> str:
+        raise NotImplementedError
+
+    def entry_status(self, symbol: str, order_id: str) -> dict:
+        """{'status': 'open' | 'filled' | 'canceled', 'filled': miktar, 'price': ort. fiyat, 'fee': USDT}"""
+        raise NotImplementedError
+
+    def cancel_entry(self, symbol: str, order_id: str) -> dict:
+        raise NotImplementedError
+
+    def fetch_funding_recent(self, symbol: str, limit: int = 200) -> pd.Series | None:
+        return None
+
     def round_qty(self, symbol: str, qty: float) -> float:
         return qty
 
@@ -93,13 +107,22 @@ def ohlcv_to_df(rows: list) -> pd.DataFrame:
     return df.set_index("timestamp").astype(float)
 
 
+def klines_to_df(rows: list) -> pd.DataFrame:
+    """Binance ham kline -> DataFrame (taker_buy_volume = agresif alıcıların hacmi)."""
+    df = pd.DataFrame([r[:6] + [r[9]] for r in rows],
+                      columns=["timestamp", "open", "high", "low", "close", "volume", "taker_buy_volume"])
+    df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
+    return df.set_index("timestamp").astype(float)
+
+
 def _side_str(side: int) -> str:
     return "buy" if side == 1 else "sell"
 
 
 class FuturesExchange(FuturesClient):
     def __init__(self, name: str = "binanceusdm", api_key: str = "", api_secret: str = "",
-                 testnet: bool = False, testnet_kind: str = "testnet"):
+                 testnet: bool = False, testnet_kind: str = "testnet", tp_limit: bool = False):
+        self.tp_limit = tp_limit
         cls = getattr(ccxt, name)
         self.ex = cls({
             "apiKey": api_key,
@@ -115,21 +138,33 @@ class FuturesExchange(FuturesClient):
         self.ex.load_markets()
 
     # ------------------------------------------------------------ veri
+    def _klines(self, symbol, timeframe, limit, start_ms=None):
+        params = {"symbol": self.ex.market(symbol)["id"], "interval": timeframe, "limit": min(int(limit), 1500)}
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        return self.ex.fapiPublicGetKlines(params)
+
     def fetch_ohlcv(self, symbol, timeframe, limit=500):
-        return ohlcv_to_df(self.ex.fetch_ohlcv(symbol, timeframe, limit=limit))
+        return klines_to_df(self._klines(symbol, timeframe, limit))
 
     def fetch_ohlcv_range(self, symbol, timeframe, since_ms: int) -> pd.DataFrame:
         rows, since = [], since_ms
         while True:
-            batch = self.ex.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+            batch = self._klines(symbol, timeframe, 1500, since)
             if not batch:
                 break
             rows += batch
-            since = batch[-1][0] + 1
-            if len(batch) < 1000:
+            since = int(batch[-1][0]) + 1
+            if len(batch) < 1500:
                 break
-        df = ohlcv_to_df(rows)
+            time.sleep(0.2)
+        df = klines_to_df(rows)
         return df[~df.index.duplicated()]
+
+    def fetch_funding_recent(self, symbol, limit=200):
+        rows = self.ex.fetch_funding_rate_history(symbol, limit=limit)
+        return pd.Series({pd.Timestamp(r["timestamp"], unit="ms", tz="UTC"): float(r["fundingRate"])
+                          for r in rows}).sort_index()
 
     def fetch_funding_range(self, symbol, since_ms: int) -> pd.Series:
         rows, since = [], since_ms
@@ -210,9 +245,38 @@ class FuturesExchange(FuturesClient):
         qty = self.round_qty(symbol, pos.qty)
         self.ex.create_order(symbol, "market", close_side, qty, None,
                              {**common, "stopLossPrice": self.round_price(symbol, stop)})
-        if take_profit:
+        if take_profit and self.tp_limit:
+            # deftere yazılı limit emir -> maker ücreti, kaymasız
+            self.ex.create_order(symbol, "limit", close_side, qty, self.round_price(symbol, take_profit),
+                                 {"reduceOnly": True, "timeInForce": "GTC"})
+        elif take_profit:
             self.ex.create_order(symbol, "market", close_side, qty, None,
                                  {**common, "takeProfitPrice": self.round_price(symbol, take_profit)})
+
+    def place_limit_entry(self, symbol, side, qty, price):
+        # GTX = post-only: emir hemen eşleşecekse borsa reddeder -> her zaman maker olur
+        o = self.ex.create_order(symbol, "limit", _side_str(side), self.round_qty(symbol, qty),
+                                 self.round_price(symbol, price), {"timeInForce": "GTX"})
+        return str(o["id"])
+
+    def entry_status(self, symbol, order_id):
+        o = self.ex.fetch_order(order_id, symbol)
+        filled = float(o.get("filled") or 0)
+        st = o.get("status")
+        status = "filled" if st == "closed" else ("open" if st == "open" else "canceled")
+        price = float(o.get("average") or o.get("price") or 0)
+        fee = sum(float(f["cost"]) for f in (o.get("fees") or []) if f and f.get("cost")
+                  and f.get("currency") == "USDT") or filled * price * 0.0002
+        return {"status": status, "filled": filled, "price": price, "fee": fee}
+
+    def cancel_entry(self, symbol, order_id):
+        try:
+            self.ex.cancel_order(order_id, symbol)
+        except ccxt.OrderNotFound:
+            pass
+        except ccxt.BaseError:
+            pass
+        return self.entry_status(symbol, order_id)
 
     def cancel_protection(self, symbol):
         for params in ({"trigger": True}, {}):          # koşullu (algo) emirler + normal emirler
@@ -259,9 +323,14 @@ class PaperFutures(FuturesClient):
     """Sanal vadeli işlem hesabı (çoklu coin). Borsadaki stop / kâr-al emirlerini her fiyat okumasında
     simüle eder. Borsaya hiçbir emir gönderilmez."""
 
-    def __init__(self, data_source, balance: float, fee_rate: float, slippage: float, leverage: float):
+    def __init__(self, data_source, balance: float, fee_rate: float, slippage: float, leverage: float,
+                 maker_fee: float | None = None, tp_limit: bool = False):
         self.src = data_source
         self.fee_rate, self.slippage, self.lev = fee_rate, slippage, leverage
+        self.maker_fee = fee_rate if maker_fee is None else maker_fee
+        self.tp_limit = tp_limit
+        self.orders: dict[str, dict] = {}                   # bekleyen limit giriş emirleri
+        self._oid = 0
         self.balance = float(balance)                       # cüzdan (gerçekleşmiş K/Z dahil)
         self.pos: dict[str, Position] = {}
         self.protect: dict[str, tuple[float, float]] = {}
@@ -296,6 +365,7 @@ class PaperFutures(FuturesClient):
     # hesap
     def available_balance(self):
         used = sum(p.qty * p.entry / self.lev for p in self.pos.values())
+        used += sum(o["qty"] * o["price"] / self.lev for o in self.orders.values() if o["status"] == "open")
         return self.balance - used
 
     def _check_protection(self, symbol, price):
@@ -305,8 +375,10 @@ class PaperFutures(FuturesClient):
         stop, tp = prot
         hit_stop = price <= stop if p.side == 1 else price >= stop
         hit_tp = tp and (price >= tp if p.side == 1 else price <= tp)
-        if hit_stop or hit_tp:
-            self._close(symbol, stop if hit_stop else tp)
+        if hit_stop:
+            self._close(symbol, stop)
+        elif hit_tp:
+            self._close(symbol, tp, maker=self.tp_limit)
 
     def get_positions(self, symbols):
         prices = self.fetch_prices([s for s in symbols if s in self.pos]) if self.pos else {}
@@ -335,11 +407,11 @@ class PaperFutures(FuturesClient):
         self._entry_fee[symbol] = fee
         return Fill(side, qty, price, fee)
 
-    def _close(self, symbol, raw_price) -> Fill:
+    def _close(self, symbol, raw_price, maker: bool = False) -> Fill:
         p = self.pos.pop(symbol)
         self.protect.pop(symbol, None)
-        price = raw_price * (1 - p.side * self.slippage)
-        fee = p.qty * price * self.fee_rate
+        price = raw_price if maker else raw_price * (1 - p.side * self.slippage)
+        fee = p.qty * price * (self.maker_fee if maker else self.fee_rate)
         gross = max(p.side * (price - p.entry) * p.qty, -p.qty * p.entry / self.lev)  # isolated sınırı
         self.balance += gross - fee
         ef = self._entry_fee.pop(symbol, 0.0)
@@ -355,6 +427,47 @@ class PaperFutures(FuturesClient):
     def cancel_protection(self, symbol):
         self.protect.pop(symbol, None)
 
+    # limit giriş simülasyonu: fiyat limit seviyesini GEÇERSE (dokunması yetmez) maker olarak dolar
+    def place_limit_entry(self, symbol, side, qty, price):
+        if symbol in self.pos:
+            raise RuntimeError(f"Paper: {symbol} için zaten açık pozisyon var")
+        if qty * price / self.lev > self.available_balance() + 1e-9:
+            raise ValueError("Paper: yetersiz teminat")
+        self._oid += 1
+        oid = f"paper-{self._oid}"
+        self.orders[oid] = {"symbol": symbol, "side": side, "qty": qty, "price": price, "status": "open",
+                            "filled": 0.0, "fee": 0.0}
+        return oid
+
+    def _check_order(self, oid):
+        o = self.orders[oid]
+        if o["status"] != "open":
+            return
+        px = self.fetch_price(o["symbol"])
+        if (o["side"] == 1 and px < o["price"]) or (o["side"] == -1 and px > o["price"]):
+            fee = o["qty"] * o["price"] * self.maker_fee
+            self.balance -= fee
+            self.pos[o["symbol"]] = Position(o["side"], o["qty"], o["price"])
+            self._entry_fee[o["symbol"]] = fee
+            o.update(status="filled", filled=o["qty"], fee=fee)
+
+    def entry_status(self, symbol, order_id):
+        self._check_order(order_id)
+        o = self.orders[order_id]
+        return {"status": o["status"], "filled": o["filled"], "price": o["price"], "fee": o["fee"]}
+
+    def cancel_entry(self, symbol, order_id):
+        self._check_order(order_id)
+        o = self.orders[order_id]
+        if o["status"] == "open":
+            o["status"] = "canceled"
+        st = self.entry_status(symbol, order_id)
+        self.orders.pop(order_id, None)
+        return st
+
+    def fetch_funding_recent(self, symbol, limit=200):
+        return self.src.fetch_funding_recent(symbol, limit)
+
     def closed_result(self, symbol, side, since_ms, entry_fee):
         return self.last_closed.pop(symbol, None)
 
@@ -362,30 +475,33 @@ class PaperFutures(FuturesClient):
         return {"balance": self.balance,
                 "pos": {s: p.__dict__ for s, p in self.pos.items()},
                 "protect": {s: list(v) for s, v in self.protect.items()},
-                "entry_fee": self._entry_fee}
+                "entry_fee": self._entry_fee, "orders": self.orders, "oid": self._oid}
 
     def load_state(self, st: dict) -> None:
         self.balance = st["balance"]
         self.pos = {s: Position(**p) for s, p in (st.get("pos") or {}).items()}
         self.protect = {s: tuple(v) for s, v in (st.get("protect") or {}).items()}
         self._entry_fee = dict(st.get("entry_fee") or {})
+        self.orders = dict(st.get("orders") or {})
+        self._oid = int(st.get("oid") or 0)
 
 
 def build_exchange(cfg: dict) -> FuturesClient:
     ex_cfg, sec, mode = cfg["exchange"], cfg["secrets"], cfg["mode"]
+    tp_limit = cfg.get("execution", {}).get("tp_order") == "limit"
     if mode == "paper":
         src = FuturesExchange(ex_cfg["name"])          # sadece halka açık fiyat verisi
-        return PaperFutures(src, cfg["live"]["capital"], ex_cfg["fee_rate"], ex_cfg["slippage"],
-                            cfg["futures"]["leverage"])
+        return PaperFutures(src, cfg["live"]["capital"], ex_cfg["taker_fee"], ex_cfg["slippage"],
+                            cfg["futures"]["leverage"], maker_fee=ex_cfg["maker_fee"], tp_limit=tp_limit)
     if not sec["api_key"]:
         raise RuntimeError(f"{mode} modu için .env içine API anahtarı girin")
     if mode == "testnet":
         return FuturesExchange(ex_cfg["name"], sec["api_key"], sec["api_secret"], testnet=True,
-                               testnet_kind=ex_cfg.get("testnet_kind", "testnet"))
+                               testnet_kind=ex_cfg.get("testnet_kind", "testnet"), tp_limit=tp_limit)
     if mode == "live":
         if not sec["allow_live"]:
             raise RuntimeError("GERÇEK PARA modu kilitli. Bilinçli olarak açmak için .env: ALLOW_LIVE=yes")
-        return FuturesExchange(ex_cfg["name"], sec["api_key"], sec["api_secret"])
+        return FuturesExchange(ex_cfg["name"], sec["api_key"], sec["api_secret"], tp_limit=tp_limit)
     raise ValueError(mode)
 
 

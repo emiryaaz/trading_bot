@@ -13,9 +13,19 @@ exchange:
   # İşlem yapılacak coinler (USDT vadeli sürekli kontratlar). Sıra = aynı anda sinyal gelirse öncelik.
   symbols: [BTC/USDT, ETH/USDT, BNB/USDT, XRP/USDT, SOL/USDT, TRX/USDT, HYPE/USDT, ZEC/USDT, DOGE/USDT, LINK/USDT]
   timeframe: 1h          # 1m, 5m, 15m, 1h, 4h, 1d
-  fee_rate: 0.0005       # piyasa emri (taker) ücreti %0.05, pozisyon büyüklüğü üzerinden
-  slippage: 0.0003       # %0.03 tahmini kayma
+  taker_fee: 0.0005      # piyasa emri / stop ücreti %0.05 (pozisyon büyüklüğü üzerinden)
+  maker_fee: 0.0002      # deftere yazılan limit emir ücreti %0.02
+  slippage: 0.0003       # piyasa emirlerinde %0.03 tahmini kayma (limit emirde kayma yok)
   testnet_kind: testnet  # testnet = testnet.binancefuture.com anahtarı | demo = demo.binance.com anahtarı
+
+execution:
+  # entry_order: limit  -> sinyal mumunun kapanış fiyatına "post-only" limit emir konur (sadece maker olarak dolar).
+  #                        Fiyat o seviyeye dönmezse emir dolmaz ve işlem kaçırılır.
+  # entry_order: market -> hemen piyasa emriyle girilir (taker ücreti + kayma).
+  entry_order: limit
+  limit_offset_atr: 0.0  # limit fiyatı = kapanış -/+ (bu x ATR). 0 = tam kapanış fiyatı
+  limit_ttl_bars: 1      # limit emir kaç mum bekler; dolmazsa iptal edilir
+  tp_order: limit        # kâr-al emri: limit (maker) | market (taker). Stop-loss her zaman piyasa emridir.
 
 futures:
   leverage: 2            # kaldıraç çarpanı (1-5 arası izinli)
@@ -24,13 +34,50 @@ futures:
   funding_rate_fallback: 0.0001   # backtest'te gerçek funding verisi yoksa 8 saatlik varsayılan oran
 
 strategy:
-  name: sma_cross_rsi
+  # multi_factor : çok katmanlı indikatör stratejisi (v0.5, varsayılan)
+  #   Varsayılan açık katmanlar (1-3): eğitim verisinde kâr faktörünü belirgin artıranlar.
+  #   Kapalı katmanlar (geri çekilme, MACD, Fibonacci, hacim): 1 yıllık veride katkı sağlamadı;
+  #   `python main.py layers` ile her birinin etkisini görebilirsiniz.
+  # sma_cross_rsi: eski basit SMA kesişimi (karşılaştırma için; parametreleri: fast, slow, rsi_*, atr_period)
+  name: multi_factor
   params:
-    fast: 20             # hızlı hareketli ortalama
-    slow: 50             # yavaş hareketli ortalama
+    # --- 1) Piyasa rejimi: trend yeterince güçlü mü? (ADX, üst zaman diliminde)
+    use_regime: true
+    adx_period: 14
+    adx_min: 20              # ADX bunun altındaysa piyasa yatay sayılır, işlem açılmaz
+    # --- 2) Yön: üst zaman diliminde trend + BTC'nin yönü
+    use_htf: true
+    htf: 4h                  # üst zaman dilimi (timeframe 4h ise 1D yapın)
+    htf_fast: 21             # 4s'te fiyat > EMA21 > EMA55 ise sadece LONG, tersi ise sadece SHORT
+    htf_slow: 55
+    use_btc_filter: true     # altcoinlerde BTC'nin 4s yönü ters olmamalı
+    # --- 3) Giriş zamanlaması
+    trigger: cross           # cross: SMA20/50 kesişimi | pullback: trend yönünde RSI geri çekilmesi bitince
+    fast: 20                 # cross için hızlı SMA
+    slow: 50                 # cross için yavaş SMA
     rsi_period: 14
-    rsi_max_entry: 70    # RSI bunun üstündeyse LONG açma (aşırı alım)
-    rsi_min_entry: 30    # RSI bunun altındaysa SHORT açma (aşırı satım)
+    pull_window: 8           # son 8 mumda geri çekilme aranır
+    rsi_pull_long: 40        # LONG: RSI 40'ın altına inmiş olmalı...
+    rsi_trigger_long: 45     # ...ve şimdi 45'i yukarı kesmeli
+    rsi_pull_short: 60       # SHORT: RSI 60'ın üstüne çıkmış olmalı...
+    rsi_trigger_short: 55    # ...ve şimdi 55'i aşağı kesmeli
+    use_macd: false          # MACD histogramı giriş yönüne dönmüş olmalı
+    use_fib: false           # geri çekilme son salınımın Fibonacci 0.382 - 0.786 bölgesinde olmalı
+    fib_lookback: 72
+    fib_min: 0.382
+    fib_max: 0.786
+    # --- 4) Onay
+    use_volume: false        # son mumun hacmi 20 mumluk ortalamanın üstünde olmalı
+    volume_period: 20
+    volume_min: 1.0
+    # --- 5) Vadeli piyasa verileri (fiyattan bağımsız bilgi)
+    use_funding: true        # funding aşırı pozitifken LONG, aşırı negatifken SHORT açma (kalabalığa katılma)
+    funding_window_days: 30  # "aşırı" = son 30 günün ortalamasından 2 standart sapma uzak...
+    funding_z_max: 2.0
+    funding_abs_max: 0.0005  # ...ya da 8 saatlik oran %0.05'i aşmış
+    use_taker_flow: false    # son 6 mumda agresif alıcıların payı giriş yönünü desteklemeli
+    flow_period: 6           # (veri için bir kez: python main.py backtest --refresh)
+    flow_min: 0.5
     atr_period: 14
 
 risk:
@@ -41,8 +88,9 @@ risk:
   stop_mode: roe              # roe = teminatın yüzdesi | atr = oynaklığa göre (karşılaştırma için)
   stop_loss_roe: 0.05         # teminatın %5'i zararda kapat  (2x'te fiyatın %2.5'i)
   take_profit_roe: 0.05       # teminatın %5'i kârda kapat   (0 = kapalı)
-  stop_atr_mult: 2.0          # sadece stop_mode: atr iken
-  take_profit_atr_mult: 4.0   # sadece stop_mode: atr iken
+  stop_atr_mult: 2.0          # sadece stop_mode: atr iken: stop = giriş -/+ 2 x ATR
+  take_profit_atr_mult: 4.0   # sadece stop_mode: atr iken (0 = kapalı)
+  risk_per_trade_pct: 0.01    # sadece stop_mode: atr iken: stop'ta kayıp = bakiyenin %1'i (boyut buna göre)
   max_drawdown_pct: 0.10      # DEVRE KESİCİ: son başlatmaya göre %10 kayıpta dur + rapor ver
   max_daily_loss_pct: 0.03    # gün içinde %3 kayıpta o gün yeni işlem açma (0 = kapalı)
   kill_switch_file: STOP      # proje klasöründe "STOP" adlı dosya varsa pozisyonu kapatıp dur
