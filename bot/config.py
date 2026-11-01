@@ -46,7 +46,15 @@ def validate(cfg: dict) -> None:
     if fut["margin_mode"] != "isolated":
         raise ValueError("Bu bot yalnızca isolated marjin ile çalışır")
 
+    syms = cfg.get("exchange", {}).get("symbols")
+    if syms is not None and (not syms or len(set(syms)) != len(syms)):
+        raise ValueError("exchange.symbols boş olamaz ve tekrar eden coin içeremez")
+
     r = cfg["risk"]
+    if r.get("max_open_positions", 1) < 1:
+        raise ValueError("max_open_positions en az 1 olmalı")
+    if not 0 < r.get("max_total_margin_pct", 1) <= 1:
+        raise ValueError("max_total_margin_pct 0 ile 1 arasında olmalı")
     if not 0 < r["margin_per_trade_pct"] <= 1:
         raise ValueError("margin_per_trade_pct 0 ile 1 arasında olmalı")
     if r["stop_mode"] not in ("roe", "atr"):

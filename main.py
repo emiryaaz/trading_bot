@@ -1,9 +1,9 @@
 """Komut satırı.
 
-    python main.py backtest              # Binance Futures geçmiş verisiyle strateji testi (%70 eğitim / %30 test)
+    python main.py backtest              # 10 coin, Binance Futures geçmiş verisiyle portföy testi (+ coin bazında)
     python main.py backtest --compare    # ayar varyasyonlarını karşılaştır (ROE vs ATR, long+short vs long)
     python main.py backtest --synthetic  # internet olmadan, sahte veriyle (sadece kod testi)
-    python main.py info                  # sembolün borsa limitleri ve gereken minimum sermaye
+    python main.py info                  # her coinin borsa limitleri ve gereken minimum sermaye
     python main.py run                   # config.yaml'daki moda göre botu başlat (paper/testnet/live)
     python main.py status                # durum, açık pozisyon ve son işlemler
     python main.py report                # şu anki dönemin raporunu üret
@@ -19,7 +19,7 @@ import pandas as pd
 
 from bot.backtest import run_backtest
 from bot.config import ROOT, futures_symbol, load_config
-from bot.data import TF_MINUTES, load_history, synthetic_ohlcv
+from bot.data import TF_MINUTES, load_history, synthetic_portfolio
 from bot.risk import RiskManager
 from bot.strategy import build_strategy
 
@@ -39,18 +39,36 @@ def _print(name, res):
         print(f"  {k:<30} {v}")
 
 
+def _resample(data: dict, tf: str) -> dict:
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    return {k: d.resample(tf).agg(agg).dropna() for k, d in data.items()}
+
+
+def _slice(data: dict, start=None, end=None) -> dict:
+    return {k: d.loc[start:end] for k, d in data.items() if len(d.loc[start:end])}
+
+
 def cmd_backtest(cfg, synthetic, refresh, split, compare):
+    ex = cfg["exchange"]
     if synthetic:
-        df, funding = synthetic_ohlcv(timeframe=cfg["exchange"]["timeframe"]), None
+        data, funding = synthetic_portfolio(ex["symbols"], timeframe=ex["timeframe"]), {}
     else:
-        df, funding = load_history(cfg, refresh)
-    print(f"{len(df)} mum | {df.index[0]} -> {df.index[-1]}"
-          + ("  (SENTETİK VERİ)" if synthetic else "")
-          + ("" if funding is not None else "  | funding: varsayılan oran"))
-    f = cfg["futures"]
-    r = cfg["risk"]
+        print("Veri yükleniyor...")
+        data, funding = load_history(cfg, refresh)
+    if not data:
+        print("Hiç veri yok.")
+        return
+    idx = sorted(set().union(*[d.index for d in data.values()]))
+    print(f"{len(data)} coin | {idx[0]} -> {idx[-1]}" + ("  (SENTETİK VERİ)" if synthetic else ""))
+    for k, d in data.items():
+        has_f = funding.get(k) is not None
+        print(f"  {k:<11} {len(d):>6} mum, başlangıç {d.index[0]:%Y-%m-%d}" + ("" if has_f else "  (funding: varsayılan)"))
+    f, r = cfg["futures"], cfg["risk"]
     print(f"Ayarlar: {f['leverage']}x isolated | teminat/işlem %{r['margin_per_trade_pct'] * 100:.0f} | "
+          f"en fazla {r['max_open_positions']} pozisyon, toplam teminat ≤ %{r['max_total_margin_pct'] * 100:.0f} | "
           f"stop {r['stop_mode']} | short {'açık' if f['allow_short'] else 'kapalı'}")
+
+    cut_time = idx[int(len(idx) * split)] if split else None
 
     if compare:
         variants = {
@@ -58,6 +76,8 @@ def cmd_backtest(cfg, synthetic, refresh, split, compare):
             "Sadece long": {"futures": {"allow_short": False}},
             "ATR stop (2x / 4x ATR)": {"risk": {"stop_mode": "atr"}},
             "ROE %5 stop, %10 kâr-al": {"risk": {"take_profit_roe": 0.10}},
+            "En fazla 1 pozisyon": {"risk": {"max_open_positions": 1}},
+            "En fazla 5 pozisyon": {"risk": {"max_open_positions": 5, "max_total_margin_pct": 1.0}},
             "4 saatlik mumlar": {"exchange": {"timeframe": "4h"}},
         }
         rows = []
@@ -65,28 +85,23 @@ def cmd_backtest(cfg, synthetic, refresh, split, compare):
             c = copy.deepcopy(cfg)
             for sec, vals in over.items():
                 c[sec].update(vals)
-            d = df
-            if c["exchange"]["timeframe"] != cfg["exchange"]["timeframe"]:
-                d = df.resample(c["exchange"]["timeframe"]).agg(
-                    {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
-            cut = int(len(d) * split) if split else 0
+            d = data if c["exchange"]["timeframe"] == ex["timeframe"] else _resample(data, c["exchange"]["timeframe"])
             m_all = _bt(c, d, funding).metrics()
-            m_test = _bt(c, d.iloc[cut:], funding).metrics() if split else m_all
+            m_test = _bt(c, _slice(d, cut_time), funding).metrics() if split else m_all
             rows.append({"Varyasyon": name, "Getiri %": m_all["Toplam getiri %"],
                          "Maks DD %": m_all["Maks. düşüş (drawdown) %"],
                          "İşlem": m_all["İşlem sayısı (long/short)"], "Kazanma %": m_all["Kazanma oranı %"],
-                         "Kâr faktörü": m_all["Kâr faktörü"], "Test dönemi getiri %": m_test["Toplam getiri %"],
+                         "KF": m_all["Kâr faktörü"], "Test getiri %": m_test["Toplam getiri %"],
                          "Test KF": m_test["Kâr faktörü"],
-                         "Devre kesici": m_all["Devre kesici (%10) tetiklenme"].split(",")[0]})
-        pd.set_option("display.width", 200)
+                         "Devre kesici": m_all["Devre kesici tetiklenme"].split(",")[0]})
+        pd.set_option("display.width", 220)
         print("\n" + pd.DataFrame(rows).set_index("Varyasyon").to_string())
         return
 
-    parts = [("Tüm veri", df)]
+    parts = [("Tüm veri", data)]
     if split:
-        cut = int(len(df) * split)
-        parts += [(f"Eğitim (ilk %{split * 100:.0f})", df.iloc[:cut]),
-                  (f"Test (son %{(1 - split) * 100:.0f})", df.iloc[cut:])]
+        parts += [(f"Eğitim (ilk %{split * 100:.0f})", _slice(data, None, cut_time)),
+                  (f"Test (son %{(1 - split) * 100:.0f})", _slice(data, cut_time))]
     res_all = None
     for name, part in parts:
         res = _bt(cfg, part, funding)
@@ -94,6 +109,10 @@ def cmd_backtest(cfg, synthetic, refresh, split, compare):
         _print(name, res)
         for ev in res.breaker_events[:5]:
             print(f"    devre kesici: {ev['time']}  {ev['baseline']} → {ev['equity']}")
+
+    pd.set_option("display.width", 220)
+    print("\n=== Coin bazında (tüm veri) ===")
+    print(res_all.per_symbol().to_string())
 
     out = ROOT / "data" / "backtest_trades.csv"
     out.parent.mkdir(exist_ok=True)
@@ -124,17 +143,24 @@ def cmd_run(cfg):
 def cmd_info(cfg):
     from bot.exchange import FuturesExchange
     ex = FuturesExchange(cfg["exchange"]["name"])
-    sym = futures_symbol(cfg["exchange"]["symbol"])
-    price = ex.fetch_price(sym)
-    min_n, min_q = ex.min_notional(sym), ex.min_qty(sym)
-    r, lev = cfg["risk"], cfg["futures"]["leverage"]
-    need = max(min_n, min_q * price) / (r["margin_per_trade_pct"] * lev)
-    print(f"{sym}  fiyat {price:.2f}")
-    print(f"  Borsa minimum pozisyon: {min_n} USDT, minimum miktar: {min_q}")
-    print(f"  Mevcut ayarlarla (teminat %{r['margin_per_trade_pct'] * 100:.0f}, {lev}x) gereken minimum capital: "
-          f"~{need * 1.05:.0f} USDT")
-    print(f"  config.yaml → live.capital = {cfg['live']['capital']} USDT "
-          + ("✓" if cfg["live"]["capital"] >= need * 1.05 else "✗ YETERSİZ: capital'i artırın veya başka sembol seçin"))
+    r, lev, cap = cfg["risk"], cfg["futures"]["leverage"], cfg["live"]["capital"]
+    syms = [futures_symbol(s) for s in cfg["exchange"]["symbols"]]
+    prices = ex.fetch_prices([s for s in syms if s in ex.ex.markets])
+    print(f"Ayarlar: capital {cap} USDT | teminat/işlem %{r['margin_per_trade_pct'] * 100:.0f} | {lev}x "
+          f"→ işlem başına pozisyon ~{cap * r['margin_per_trade_pct'] * lev:.2f} USDT\n")
+    print(f"{'Coin':<16}{'Fiyat':>12}{'Min. pozisyon':>16}{'Gereken capital':>18}  Durum")
+    worst = 0.0
+    for s in syms:
+        if s not in ex.ex.markets:
+            print(f"{s:<16}{'-':>12}{'-':>16}{'-':>18}  ✗ Binance Futures'ta bulunamadı")
+            continue
+        px = prices.get(s) or ex.fetch_price(s)
+        need_notional = max(ex.min_notional(s), ex.min_qty(s) * px)
+        need = need_notional / (r["margin_per_trade_pct"] * lev) * 1.05
+        worst = max(worst, need)
+        ok = "✓" if cap >= need else "✗ capital yetersiz"
+        print(f"{s:<16}{px:>12g}{need_notional:>13.2f} $ {need:>15.0f} $  {ok}")
+    print(f"\nTüm coinlerde işlem yapabilmek için gereken minimum capital: ~{worst:.0f} USDT")
 
 
 def cmd_status(cfg):
@@ -148,11 +174,15 @@ def cmd_status(cfg):
     print(f"Durum: {'DURDURULDU - ' + str(st['halt_reason']) if st.get('halted') else 'aktif'}")
     print(f"Bot bakiyesi (gerçekleşmiş): {eq:.2f} USDT | dönem başı {base:.2f} | "
           f"devre kesici seviyesi {base * (1 - cfg['risk']['max_drawdown_pct']):.2f}")
-    print("Açık pozisyon:", st.get("position"))
+    pos = st.get("positions") or {}
+    print(f"Açık pozisyonlar ({len(pos)}):")
+    for sym, p in pos.items():
+        print(f"  {sym.split(':')[0]:<10} {'LONG' if p['side'] == 1 else 'SHORT':<5} {p['qty']} @ {p['entry']:g} | "
+              f"stop {p['stop']:g} | kâr-al {p['take_profit']:g} | teminat {p['margin']:.2f}")
     trades = st.get("trades", [])
     print(f"Toplam işlem: {len(trades)} | Toplam K/Z: {sum(t['pnl'] for t in trades):+.2f} USDT")
     for t in trades[-10:]:
-        print(f"  {t['closed'][:16]} {t['side']:<5} {t['entry']:.2f} → {t['exit']:.2f}  "
+        print(f"  {t['closed'][:16]} {t.get('symbol', ''):<10} {t['side']:<5} {t['entry']:g} → {t['exit']:g}  "
               f"{t['pnl']:+.2f} ({t['roe'] * 100:+.1f}%)  {t['reason']}")
     if st.get("last_report"):
         print("Son rapor:", st["last_report"])

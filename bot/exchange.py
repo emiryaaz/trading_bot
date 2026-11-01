@@ -52,6 +52,17 @@ class FuturesClient(ABC):
     def available_balance(self) -> float: ...
     @abstractmethod
     def get_position(self, symbol: str) -> Position | None: ...
+
+    def fetch_prices(self, symbols: list[str]) -> dict[str, float]:
+        return {s: self.fetch_price(s) for s in symbols}
+
+    def get_positions(self, symbols: list[str]) -> dict[str, Position]:
+        out = {}
+        for s in symbols:
+            p = self.get_position(s)
+            if p:
+                out[s] = p
+        return out
     @abstractmethod
     def open_position(self, symbol: str, side: int, qty: float) -> Fill: ...
     @abstractmethod
@@ -152,14 +163,23 @@ class FuturesExchange(FuturesClient):
         bal = self.ex.fetch_balance()
         return float((bal.get("free") or {}).get("USDT", 0) or 0)
 
+    def fetch_prices(self, symbols):
+        tick = self.ex.fetch_tickers(symbols)                 # tek istekte tüm coinler
+        return {s: float(tick[s]["last"]) for s in symbols if s in tick}
+
     # ------------------------------------------------------------ pozisyon
-    def get_position(self, symbol):
-        for p in self.ex.fetch_positions([symbol]):
+    def get_positions(self, symbols):
+        out = {}
+        for p in self.ex.fetch_positions(symbols):            # tek istekte tüm coinler
             qty = float(p.get("contracts") or 0)
-            if p.get("symbol") == symbol and qty > 0:
+            if p.get("symbol") in symbols and qty > 0:
                 side = 1 if p.get("side") == "long" else -1
-                return Position(side, qty, float(p.get("entryPrice") or 0), float(p.get("unrealizedPnl") or 0))
-        return None
+                out[p["symbol"]] = Position(side, qty, float(p.get("entryPrice") or 0),
+                                            float(p.get("unrealizedPnl") or 0))
+        return out
+
+    def get_position(self, symbol):
+        return self.get_positions([symbol]).get(symbol)
 
     def _fill(self, symbol: str, order: dict, side: int) -> Fill:
         qty = float(order.get("filled") or order.get("amount") or 0)
@@ -236,17 +256,17 @@ class FuturesExchange(FuturesClient):
 
 
 class PaperFutures(FuturesClient):
-    """Sanal vadeli işlem hesabı. Borsadaki stop / kâr-al emirlerini her fiyat okumasında simüle eder."""
+    """Sanal vadeli işlem hesabı (çoklu coin). Borsadaki stop / kâr-al emirlerini her fiyat okumasında
+    simüle eder. Borsaya hiçbir emir gönderilmez."""
 
     def __init__(self, data_source, balance: float, fee_rate: float, slippage: float, leverage: float):
         self.src = data_source
         self.fee_rate, self.slippage, self.lev = fee_rate, slippage, leverage
-        self.balance = float(balance)          # cüzdan (gerçekleşmiş K/Z dahil)
-        self.pos: Position | None = None
-        self.protect: tuple[float, float] | None = None
-        self.last_closed: ClosedResult | None = None
-        self._entry_fee = 0.0
-        self._funding = 0.0
+        self.balance = float(balance)                       # cüzdan (gerçekleşmiş K/Z dahil)
+        self.pos: dict[str, Position] = {}
+        self.protect: dict[str, tuple[float, float]] = {}
+        self.last_closed: dict[str, ClosedResult] = {}
+        self._entry_fee: dict[str, float] = {}
 
     # veri
     def fetch_ohlcv(self, symbol, timeframe, limit=500):
@@ -254,6 +274,9 @@ class PaperFutures(FuturesClient):
 
     def fetch_price(self, symbol):
         return self.src.fetch_price(symbol)
+
+    def fetch_prices(self, symbols):
+        return self.src.fetch_prices(symbols)
 
     def setup(self, symbol, leverage, margin_mode):
         pass
@@ -272,76 +295,80 @@ class PaperFutures(FuturesClient):
 
     # hesap
     def available_balance(self):
-        used = self.pos.qty * self.pos.entry / self.lev if self.pos else 0.0
+        used = sum(p.qty * p.entry / self.lev for p in self.pos.values())
         return self.balance - used
 
-    def _check_protection(self, symbol):
-        if not (self.pos and self.protect):
+    def _check_protection(self, symbol, price):
+        p, prot = self.pos.get(symbol), self.protect.get(symbol)
+        if not (p and prot):
             return
-        price = self.fetch_price(symbol)
-        stop, tp = self.protect
-        s = self.pos.side
-        hit_stop = price <= stop if s == 1 else price >= stop
-        hit_tp = tp and (price >= tp if s == 1 else price <= tp)
+        stop, tp = prot
+        hit_stop = price <= stop if p.side == 1 else price >= stop
+        hit_tp = tp and (price >= tp if p.side == 1 else price <= tp)
         if hit_stop or hit_tp:
-            trigger = stop if hit_stop else tp
-            self._close(symbol, trigger)
+            self._close(symbol, stop if hit_stop else tp)
+
+    def get_positions(self, symbols):
+        prices = self.fetch_prices([s for s in symbols if s in self.pos]) if self.pos else {}
+        out = {}
+        for s in symbols:
+            if s in self.pos and s in prices:
+                self._check_protection(s, prices[s])
+            if s in self.pos:
+                p = self.pos[s]
+                p.unrealized = p.side * (prices.get(s, p.entry) - p.entry) * p.qty
+                out[s] = p
+        return out
 
     def get_position(self, symbol):
-        self._check_protection(symbol)
-        if self.pos:
-            self.pos.unrealized = self.pos.side * (self.fetch_price(symbol) - self.pos.entry) * self.pos.qty
-        return self.pos
+        return self.get_positions([symbol]).get(symbol)
 
     def open_position(self, symbol, side, qty):
-        if self.pos:
-            raise RuntimeError("Paper: zaten açık pozisyon var")
+        if symbol in self.pos:
+            raise RuntimeError(f"Paper: {symbol} için zaten açık pozisyon var")
         price = self.fetch_price(symbol) * (1 + side * self.slippage)
         fee = qty * price * self.fee_rate
         if qty * price / self.lev + fee > self.available_balance() + 1e-9:
             raise ValueError("Paper: yetersiz teminat")
         self.balance -= fee
-        self.pos = Position(side, qty, price)
-        self._entry_fee, self._funding = fee, 0.0
+        self.pos[symbol] = Position(side, qty, price)
+        self._entry_fee[symbol] = fee
         return Fill(side, qty, price, fee)
 
     def _close(self, symbol, raw_price) -> Fill:
-        p = self.pos
+        p = self.pos.pop(symbol)
+        self.protect.pop(symbol, None)
         price = raw_price * (1 - p.side * self.slippage)
         fee = p.qty * price * self.fee_rate
-        gross = p.side * (price - p.entry) * p.qty
-        margin = p.qty * p.entry / self.lev
-        gross = max(gross, -margin)                  # isolated: kayıp teminatla sınırlı
+        gross = max(p.side * (price - p.entry) * p.qty, -p.qty * p.entry / self.lev)  # isolated sınırı
         self.balance += gross - fee
-        self.last_closed = ClosedResult(price, gross - fee - self._entry_fee - self._funding,
-                                        fee + self._entry_fee, self._funding)
-        self.pos, self.protect = None, None
+        ef = self._entry_fee.pop(symbol, 0.0)
+        self.last_closed[symbol] = ClosedResult(price, gross - fee - ef, fee + ef, 0.0)
         return Fill(-p.side, p.qty, price, fee)
 
     def close_position(self, symbol, pos):
         return self._close(symbol, self.fetch_price(symbol))
 
     def place_protection(self, symbol, pos, stop, take_profit):
-        self.protect = (stop, take_profit)
+        self.protect[symbol] = (stop, take_profit)
 
     def cancel_protection(self, symbol):
-        self.protect = None
+        self.protect.pop(symbol, None)
 
     def closed_result(self, symbol, side, since_ms, entry_fee):
-        r, self.last_closed = self.last_closed, None
-        return r
+        return self.last_closed.pop(symbol, None)
 
     def to_state(self) -> dict:
         return {"balance": self.balance,
-                "pos": self.pos.__dict__ if self.pos else None,
-                "protect": list(self.protect) if self.protect else None,
+                "pos": {s: p.__dict__ for s, p in self.pos.items()},
+                "protect": {s: list(v) for s, v in self.protect.items()},
                 "entry_fee": self._entry_fee}
 
     def load_state(self, st: dict) -> None:
         self.balance = st["balance"]
-        self.pos = Position(**st["pos"]) if st.get("pos") else None
-        self.protect = tuple(st["protect"]) if st.get("protect") else None
-        self._entry_fee = st.get("entry_fee", 0.0)
+        self.pos = {s: Position(**p) for s, p in (st.get("pos") or {}).items()}
+        self.protect = {s: tuple(v) for s, v in (st.get("protect") or {}).items()}
+        self._entry_fee = dict(st.get("entry_fee") or {})
 
 
 def build_exchange(cfg: dict) -> FuturesClient:

@@ -59,7 +59,8 @@ def write_report(state: dict, cfg: dict, reason: str, equity: float) -> Path:
         "| | |",
         "|---|---|",
         f"| Mod | {cfg['mode']} |",
-        f"| Sembol / zaman dilimi | {cfg['exchange']['symbol']} / {cfg['exchange']['timeframe']} |",
+        f"| Coinler / zaman dilimi | {', '.join(c.split('/')[0] for c in cfg['exchange']['symbols'])} "
+        f"/ {cfg['exchange']['timeframe']} |",
         f"| Dönem | {sess['start']} → {now.isoformat(timespec='seconds')} |",
         f"| Başlangıç bakiyesi | {base:.2f} USDT |",
         f"| Güncel bakiye | {equity:.2f} USDT |",
@@ -73,20 +74,38 @@ def write_report(state: dict, cfg: dict, reason: str, equity: float) -> Path:
         f"| Ödenen ücret / funding | {s['fees']:.2f} / {s['funding']:.2f} USDT |",
         f"| Kapanış nedenleri | {s['reasons']} |",
         "",
+        "## Coin bazında",
+        "",
+        "| Coin | İşlem | Kazanma % | K/Z (USDT) | Long K/Z | Short K/Z | Stop'la kapanan |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    by_coin: dict[str, list] = {}
+    for t in trades:
+        by_coin.setdefault(t.get("symbol", "?"), []).append(t)
+    for coin, ts in sorted(by_coin.items(), key=lambda kv: sum(x["pnl"] for x in kv[1])):
+        w = sum(x["pnl"] > 0 for x in ts)
+        lines.append(f"| {coin} | {len(ts)} | {w / len(ts) * 100:.0f} | {sum(x['pnl'] for x in ts):+.2f} | "
+                     f"{sum(x['pnl'] for x in ts if x['side'] == 'LONG'):+.2f} | "
+                     f"{sum(x['pnl'] for x in ts if x['side'] == 'SHORT'):+.2f} | "
+                     f"{sum(x['reason'].startswith('stop') for x in ts)} |")
+    lines += [
+        "",
         "## İşlemler",
         "",
-        "| # | Yön | Açılış | Kapanış | Giriş | Çıkış | K/Z (USDT) | ROE % | Neden |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| # | Coin | Yön | Açılış | Kapanış | Giriş | Çıkış | K/Z (USDT) | ROE % | Neden |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for i, t in enumerate(trades, 1):
-        lines.append(f"| {i} | {t['side']} | {t['opened'][:16]} | {t['closed'][:16]} | {t['entry']:.2f} | "
-                     f"{t['exit']:.2f} | {t['pnl']:+.2f} | {t['roe'] * 100:+.1f} | {t['reason']} |")
+        lines.append(f"| {i} | {t.get('symbol', '?')} | {t['side']} | {t['opened'][:16]} | {t['closed'][:16]} | "
+                     f"{t['entry']:g} | {t['exit']:g} | {t['pnl']:+.2f} | {t['roe'] * 100:+.1f} | {t['reason']} |")
     lines += [
         "",
         "## Değerlendirme için sorular",
         "",
         "- Kayıplar çoğunlukla stop-loss'tan mı geliyor? Stop çok mu dar (stop_loss_roe / timeframe)?",
         "- Long ve short taraflarından biri belirgin şekilde kötü mü? (allow_short)",
+        "- Zararın çoğu birkaç coinden mi geliyor? O coinleri listeden çıkarmak veya stop'u genişletmek gerekebilir.",
+        "- Kayıplar aynı anda birden çok coinde mi oluştu? (coinler birlikte hareket ediyor → max_open_positions)",
         "- Kayıplar belirli saatlerde / piyasa koşullarında mı yoğunlaşıyor?",
         "- Değişiklikten sonra `python main.py backtest` ile yeni ayarları test edip ancak sonra `python main.py resume` çalıştırın.",
         "",

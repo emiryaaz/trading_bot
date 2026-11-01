@@ -10,13 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bot import indicators as ind
 from bot.backtest import run_backtest
-from bot.data import synthetic_ohlcv
+from bot.data import synthetic_ohlcv, synthetic_portfolio
 from bot.exchange import FuturesClient, FuturesExchange, PaperFutures, Position
 from bot.live import Trader
 from bot.risk import LONG, SHORT, RiskManager, liquidation_price
 from bot.strategy import SmaCrossRsi
 
-RISK = {"margin_per_trade_pct": 0.20, "stop_mode": "roe", "stop_loss_roe": 0.05, "take_profit_roe": 0.05,
+RISK = {"margin_per_trade_pct": 0.20, "max_open_positions": 3, "max_total_margin_pct": 0.60, "stop_mode": "roe", "stop_loss_roe": 0.05, "take_profit_roe": 0.05,
         "stop_atr_mult": 2.0, "take_profit_atr_mult": 4.0, "max_drawdown_pct": 0.10,
         "max_daily_loss_pct": 0.0, "kill_switch_file": "STOP_TEST_NONE"}
 PARAMS = {"fast": 20, "slow": 50, "rsi_period": 14, "rsi_max_entry": 70, "rsi_min_entry": 30, "atr_period": 14}
@@ -108,18 +108,63 @@ def test_backtest_breaker_triggers():
     assert ev["equity"] <= ev["baseline"] * 0.9 + 1e-6
 
 
+# ------------------------------------------------------------------ portföy (çoklu coin) backtest
+COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "LINK/USDT"]
+
+
+def _overlap_stats(trades):
+    events = sorted([(t.entry_time, 1, t.margin) for t in trades] + [(t.exit_time, -1, t.margin) for t in trades],
+                    key=lambda e: (e[0], e[1]))       # aynı anda kapanış önce
+    n = m = max_n = max_m = 0
+    for _, k, mg in events:
+        n += k
+        m += k * mg
+        max_n, max_m = max(max_n, n), max(max_m, m)
+    return max_n, max_m
+
+
+def test_portfolio_limits_respected():
+    data = synthetic_portfolio(COINS, n=3000)
+    res = bt(data)
+    assert {t.symbol for t in res.trades} == set(COINS)
+    max_n, max_m = _overlap_stats(res.trades)
+    assert max_n <= 3                                           # en fazla 3 açık pozisyon
+    assert max_m <= res.equity.max() * 0.60 + 1e-6              # toplam teminat sınırı
+    assert res.equity.iloc[-1] == pytest.approx(1000 + sum(t.pnl for t in res.trades), abs=1e-6)
+    for t in res.trades:                                        # aynı coinde üst üste binen pozisyon yok
+        same = [u for u in res.trades if u.symbol == t.symbol and u is not t]
+        assert all(u.exit_time <= t.entry_time or u.entry_time >= t.exit_time for u in same)
+
+
+def test_portfolio_single_position_limit():
+    risk = {**RISK, "max_open_positions": 1}
+    res = bt(synthetic_portfolio(COINS, n=2000), risk=risk)
+    assert _overlap_stats(res.trades)[0] == 1
+
+
+def test_portfolio_different_lengths():
+    """Sonradan listelenen coin (ör. HYPE) geç başlasa da test çalışmalı."""
+    data = synthetic_portfolio(COINS[:3], n=3000)
+    data["NEW/USDT"] = synthetic_ohlcv(n=1200, seed=99).set_axis(data["BTC/USDT"].index[-1200:])
+    res = bt(data)
+    new = [t for t in res.trades if t.symbol == "NEW/USDT"]
+    assert new and min(t.entry_time for t in new) >= data["NEW/USDT"].index[0]
+    assert "NEW/USDT" in res.per_symbol().index
+
+
 # ------------------------------------------------------------------ canlı döngü (sahte borsa)
 class FakeSource(FuturesClient):
-    """Sentetik veriyi mum mum 'oynatan' sahte fiyat kaynağı."""
+    """Sentetik veriyi mum mum 'oynatan' sahte fiyat kaynağı (çoklu coin)."""
 
-    def __init__(self, df):
-        self.df, self.i = df, 200
+    def __init__(self, data: dict):
+        self.data = {k if ":" in k else f"{k}:USDT": v for k, v in data.items()}
+        self.i = 200
 
     def fetch_ohlcv(self, symbol, timeframe, limit=500):
-        return self.df.iloc[max(0, self.i - limit + 1): self.i + 1]
+        return self.data[symbol].iloc[max(0, self.i - limit + 1): self.i + 1]
 
     def fetch_price(self, symbol):
-        return float(self.df["close"].iloc[self.i])
+        return float(self.data[symbol]["close"].iloc[self.i])
 
     def setup(self, *a): pass
     def available_balance(self): return 0
@@ -131,41 +176,50 @@ class FakeSource(FuturesClient):
     def closed_result(self, *a): return None
 
 
-def _cfg(tmp_path, capital=1000):
-    return {"exchange": {"symbol": "BTC/USDT", "timeframe": "1h"}, "mode": "paper",
+def _cfg(tmp_path, capital=1000, coins=COINS):
+    return {"exchange": {"symbols": coins, "timeframe": "1h"}, "mode": "paper",
             "futures": {"leverage": LEV, "margin_mode": "isolated", "allow_short": True},
             "risk": RISK, "strategy": {"name": "sma_cross_rsi", "params": PARAMS},
             "live": {"state_file": str(tmp_path / "state.json"), "poll_seconds": 0, "capital": capital}}
 
 
-def _trader(tmp_path, src, capital=1000, risk=None, paper=None):
+def _trader(tmp_path, src, capital=1000, risk=None, paper=None, coins=COINS):
     paper = paper or PaperFutures(src, capital, 0.0005, 0.0003, LEV)
-    return Trader(_cfg(tmp_path, capital), paper, SmaCrossRsi(**PARAMS), RiskManager(risk or RISK, LEV),
+    cfg = _cfg(tmp_path, capital, coins)
+    cfg["risk"] = risk or RISK
+    return Trader(cfg, paper, SmaCrossRsi(**PARAMS), RiskManager(risk or RISK, LEV),
                   state_path=tmp_path / "state.json"), paper
 
 
-def test_trader_paper_loop_and_restore(tmp_path):
-    src = FakeSource(synthetic_ohlcv(n=1500))
+def test_trader_multi_coin_loop_and_restore(tmp_path):
+    src = FakeSource(synthetic_portfolio(COINS, n=1500))
     t, paper = _trader(tmp_path, src)
+    max_open, peak = 0, 1000.0
     for i in range(200, 1499):
         src.i = i
         if not t.step():
             break
+        max_open = max(max_open, len(t.positions))
+        peak = max(peak, t.equity())
+        assert len(paper.pos) == len(t.positions)              # bot ve hesap senkron
+        assert t.used_margin() <= peak * 0.60 + 1e-6            # sınır, açılış anındaki bakiyeye göre
     trades = t.state["trades"]
-    assert len(trades) > 3
+    assert max_open == 3 and len(trades) > 10
     assert {x["side"] for x in trades} == {"LONG", "SHORT"}
+    assert len({x["symbol"] for x in trades}) >= 4
     assert "stop-loss" in {x["reason"] for x in trades}
-    # bot muhasebesi ile sanal cüzdan uyumlu olmalı
-    if t.state["position"] is None:
+    if not t.positions:
         assert t.equity() == pytest.approx(paper.balance, rel=1e-9)
-    # yeniden başlatınca durum geri yüklenmeli
     t2, p2 = _trader(tmp_path, src)
     assert len(t2.state["trades"]) == len(trades) and p2.balance == pytest.approx(paper.balance)
+    assert set(p2.pos) == set(t2.positions)
 
 
 def test_trader_breaker_halts_and_reports(tmp_path):
-    src = FakeSource(synthetic_ohlcv(n=3000, seed=3))
-    risk = {**RISK, "margin_per_trade_pct": 1.0, "take_profit_roe": 0}
+    src = FakeSource(synthetic_portfolio(COINS, n=3000))
+    # agresif: tek pozisyon, bakiyenin %90'ı teminat → her stop ≈ bakiyenin %4.5'i
+    risk = {**RISK, "margin_per_trade_pct": 0.9, "max_total_margin_pct": 1.0, "max_open_positions": 1,
+            "take_profit_roe": 0}
     t, paper = _trader(tmp_path, src, risk=risk)
     stopped = False
     for i in range(200, 2999):
@@ -174,42 +228,44 @@ def test_trader_breaker_halts_and_reports(tmp_path):
             stopped = True
             break
     assert stopped and t.state["halted"]
-    assert t.state["position"] is None and paper.pos is None          # pozisyon kapatıldı
+    assert not t.positions and not paper.pos                   # tüm pozisyonlar kapatıldı
     assert t.equity() <= 1000 * 0.9 + 1e-6
-    rep = Path(t.state["last_report"])
-    assert rep.exists() and "kayıp sınırına" in rep.read_text(encoding="utf-8")
-    assert t.step() is False                                          # durdurulmuşken işlem yapmaz
+    rep = Path(t.state["last_report"]).read_text(encoding="utf-8")
+    assert "kayıp sınırına" in rep and "Coin bazında" in rep
+    assert t.step() is False
     eq = t.resume()
     assert not t.state["halted"] and t.state["session"]["baseline"] == pytest.approx(eq)
     src.i += 1
     assert t.step() is True
 
 
-def test_kill_switch(tmp_path, monkeypatch):
-    src = FakeSource(synthetic_ohlcv(n=600))
+def test_kill_switch_closes_all(tmp_path, monkeypatch):
+    src = FakeSource(synthetic_portfolio(COINS, n=600))
     t, paper = _trader(tmp_path, src)
     src.i = 300
-    paper.open_position("BTC/USDT:USDT", SHORT, 0.001)
-    t.state["position"] = {"side": SHORT, "qty": 0.001, "entry": paper.pos.entry, "entry_fee": 0.01,
-                           "margin": 15, "stop": 1e9, "take_profit": 0, "opened": "x", "opened_ms": 0}
+    for sym, side in (("BTC/USDT:USDT", SHORT), ("ETH/USDT:USDT", LONG)):
+        f = paper.open_position(sym, side, 0.01)
+        t.positions[sym] = {"side": side, "qty": 0.01, "entry": f.price, "entry_fee": f.fee, "margin": 1,
+                            "stop": 1e9 if side == SHORT else 0, "take_profit": 0, "opened": "x", "opened_ms": 0}
     monkeypatch.setattr(t.risk, "kill_switch", lambda: True)
     assert t.step() is False
-    assert t.state["position"] is None and paper.pos is None
+    assert not t.positions and not paper.pos and len(t.state["trades"]) == 2
 
 
 def test_foreign_position_untouched(tmp_path):
-    src = FakeSource(synthetic_ohlcv(n=1500))
+    src = FakeSource(synthetic_portfolio(COINS, n=1500))
     t, paper = _trader(tmp_path, src)
-    paper.pos = Position(LONG, 0.01, 30000)          # botun açmadığı pozisyon
+    paper.pos["BTC/USDT:USDT"] = Position(LONG, 0.01, 100)   # botun açmadığı pozisyon
     for i in range(200, 1400):
         src.i = i
         t.step()
-    assert paper.pos is not None and paper.pos.qty == 0.01
-    assert t.state["trades"] == []
+    assert paper.pos["BTC/USDT:USDT"].qty == 0.01
+    assert all(x["symbol"] != "BTC/USDT" for x in t.state["trades"])
+    assert t.state["trades"]                                  # diğer coinlerde işlem devam etti
 
 
 def test_protection_failure_closes_position(tmp_path):
-    src = FakeSource(synthetic_ohlcv(n=1500))
+    src = FakeSource(synthetic_portfolio(COINS, n=1500))
 
     class BadPaper(PaperFutures):
         def place_protection(self, *a):
@@ -220,13 +276,13 @@ def test_protection_failure_closes_position(tmp_path):
     for i in range(200, 1499):
         src.i = i
         t.step()
-        assert paper.pos is None                      # korumasız pozisyon asla kalmamalı
+        assert not paper.pos                                  # korumasız pozisyon asla kalmamalı
     assert any(x["reason"].startswith("koruma emri hatası") for x in t.state["trades"])
 
 
 def test_live_mode_locked():
     from bot.exchange import build_exchange
-    cfg = {"mode": "live", "exchange": {"name": "binanceusdm", "symbol": "BTC/USDT"},
+    cfg = {"mode": "live", "exchange": {"name": "binanceusdm", "symbols": ["BTC/USDT"]},
            "futures": {"leverage": 2}, "live": {"capital": 100},
            "secrets": {"api_key": "x", "api_secret": "y", "allow_live": False}}
     with pytest.raises(RuntimeError):
@@ -239,7 +295,9 @@ def test_config_validation():
     validate(base)
     for bad in ({"futures": {"leverage": 20, "margin_mode": "isolated"}},
                 {"futures": {"leverage": 2, "margin_mode": "cross"}},
-                {"risk": {**RISK, "stop_loss_roe": 0}}):
+                {"risk": {**RISK, "stop_loss_roe": 0}},
+                {"risk": {**RISK, "max_open_positions": 0}},
+                {"exchange": {"symbols": ["BTC/USDT", "BTC/USDT"]}}):
         with pytest.raises(ValueError):
             validate({**base, **bad})
 

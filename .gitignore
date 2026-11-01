@@ -1,8 +1,14 @@
+# Gizli bilgiler - ASLA GitHub'a gitmemeli
 .env
-data/
-logs/
+
+# Sanal ortam ve Python önbellekleri
+.venv/
 __pycache__/
 *.pyc
-STOP
-.venv/
+.pytest_cache/
+
+# Bot çalışma dosyaları (kişisel işlem geçmişi, loglar, raporlar)
+data/
+logs/
 reports/
+STOP

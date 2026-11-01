@@ -10,7 +10,8 @@ mode: paper
 
 exchange:
   name: binanceusdm      # Binance global USDⓈ-M vadeli işlemler (ccxt)
-  symbol: BTC/USDT       # bot içinde otomatik olarak BTC/USDT:USDT (sürekli kontrat) olur
+  # İşlem yapılacak coinler (USDT vadeli sürekli kontratlar). Sıra = aynı anda sinyal gelirse öncelik.
+  symbols: [BTC/USDT, ETH/USDT, BNB/USDT, XRP/USDT, SOL/USDT, TRX/USDT, HYPE/USDT, ZEC/USDT, DOGE/USDT, LINK/USDT]
   timeframe: 1h          # 1m, 5m, 15m, 1h, 4h, 1d
   fee_rate: 0.0005       # piyasa emri (taker) ücreti %0.05, pozisyon büyüklüğü üzerinden
   slippage: 0.0003       # %0.03 tahmini kayma
@@ -35,6 +36,8 @@ strategy:
 risk:
   margin_per_trade_pct: 0.20  # her işlemde bot bakiyesinin %20'si teminat olur (2x ile pozisyon = bakiyenin %40'ı)
                               # => %5 teminat zararı = bot bakiyesinin %1'i
+  max_open_positions: 3       # aynı anda en fazla kaç coinde pozisyon açık olabilir
+  max_total_margin_pct: 0.60  # tüm açık pozisyonların toplam teminatı bakiyenin en fazla %60'ı
   stop_mode: roe              # roe = teminatın yüzdesi | atr = oynaklığa göre (karşılaştırma için)
   stop_loss_roe: 0.05         # teminatın %5'i zararda kapat  (2x'te fiyatın %2.5'i)
   take_profit_roe: 0.05       # teminatın %5'i kârda kapat   (0 = kapalı)
