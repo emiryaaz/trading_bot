@@ -81,6 +81,13 @@ def cmd_backtest(cfg, synthetic, refresh, split, compare):
             "Sadece long": {"futures": {"allow_short": False}},
             "ATR stop 2x/4x (risk %1)": {"risk": {"stop_mode": "atr", "risk_per_trade_pct": 0.01}},
             "ROE %5 stop, %10 kâr-al": {"risk": {"take_profit_roe": 0.10}},
+            "İzleyen stop: kâr-al 1.5R, her 1R'de stop+TP 1R yukarı": {
+                "risk": {"take_profit_roe": 0.075, "trailing": {"enabled": True, "step_r": 1, "gap_r": 1}}},
+            "İzleyen stop: kâr-al yok, her 1R'de stop 1R yukarı": {
+                "risk": {"take_profit_roe": 0, "trailing": {"enabled": True, "step_r": 1, "gap_r": 1}}},
+            "Kısmi: yarısı 1R'de, kalan stop +0.5R ve yukarı": {
+                "risk": {"partial": {"enabled": True, "at_r": 1, "fraction": 0.5, "lock_r": 0.5,
+                                     "step_r": 0.5, "gap_r": 1}}},
             "En fazla 1 pozisyon": {"risk": {"max_open_positions": 1}},
             "En fazla 5 pozisyon": {"risk": {"max_open_positions": 5, "max_total_margin_pct": 1.0}},
         }

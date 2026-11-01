@@ -68,11 +68,17 @@ class FuturesClient(ABC):
     @abstractmethod
     def close_position(self, symbol: str, pos: Position) -> Fill: ...
     @abstractmethod
-    def place_protection(self, symbol: str, pos: Position, stop: float, take_profit: float) -> None: ...
+    def place_protection(self, symbol: str, pos: Position, stop: float, take_profit: float) -> dict | None: ...
     @abstractmethod
     def cancel_protection(self, symbol: str) -> None: ...
     @abstractmethod
     def closed_result(self, symbol: str, side: int, since_ms: int, entry_fee: float) -> ClosedResult | None: ...
+
+    def update_protection(self, symbol: str, pos: Position, ids: dict | None, stop: float,
+                          take_profit: float) -> dict | None:
+        """İzleyen stop: ÖNCE yeni stop / kâr-al emrini koy, SONRA eskisini iptal et
+        (pozisyon bir an bile korumasız kalmaz). Yeni emir kimliklerini döndürür."""
+        raise NotImplementedError
 
     # --- limit (post-only) giriş emirleri
     def place_limit_entry(self, symbol: str, side: int, qty: float, price: float) -> str:
@@ -238,20 +244,50 @@ class FuturesExchange(FuturesClient):
                                  None, {"reduceOnly": True})
         return self._fill(symbol, o, -pos.side)
 
+    def _place_stop(self, symbol, pos, stop) -> str:
+        o = self.ex.create_order(symbol, "market", _side_str(-pos.side), self.round_qty(symbol, pos.qty), None,
+                                 {"reduceOnly": True, "workingType": "MARK_PRICE",
+                                  "stopLossPrice": self.round_price(symbol, stop)})
+        return str(o.get("id"))
+
+    def _place_tp(self, symbol, pos, take_profit) -> str | None:
+        if not take_profit:
+            return None
+        close_side, qty = _side_str(-pos.side), self.round_qty(symbol, pos.qty)
+        if self.tp_limit:
+            # deftere yazılı limit emir -> maker ücreti, kaymasız
+            o = self.ex.create_order(symbol, "limit", close_side, qty, self.round_price(symbol, take_profit),
+                                     {"reduceOnly": True, "timeInForce": "GTC"})
+        else:
+            o = self.ex.create_order(symbol, "market", close_side, qty, None,
+                                     {"reduceOnly": True, "workingType": "MARK_PRICE",
+                                      "takeProfitPrice": self.round_price(symbol, take_profit)})
+        return str(o.get("id"))
+
     def place_protection(self, symbol, pos, stop, take_profit):
         """Stop-loss ve kâr al emirlerini BORSAYA koyar. Bot kapansa bile çalışırlar."""
-        common = {"reduceOnly": True, "workingType": "MARK_PRICE"}
-        close_side = _side_str(-pos.side)
-        qty = self.round_qty(symbol, pos.qty)
-        self.ex.create_order(symbol, "market", close_side, qty, None,
-                             {**common, "stopLossPrice": self.round_price(symbol, stop)})
-        if take_profit and self.tp_limit:
-            # deftere yazılı limit emir -> maker ücreti, kaymasız
-            self.ex.create_order(symbol, "limit", close_side, qty, self.round_price(symbol, take_profit),
-                                 {"reduceOnly": True, "timeInForce": "GTC"})
-        elif take_profit:
-            self.ex.create_order(symbol, "market", close_side, qty, None,
-                                 {**common, "takeProfitPrice": self.round_price(symbol, take_profit)})
+        return {"sl": self._place_stop(symbol, pos, stop), "tp": self._place_tp(symbol, pos, take_profit),
+                "tp_price": take_profit}
+
+    def _cancel(self, symbol, order_id, trigger: bool):
+        if not order_id:
+            return
+        try:
+            self.ex.cancel_order(order_id, symbol, {"trigger": True} if trigger else {})
+        except ccxt.BaseError:
+            pass                                     # zaten tetiklenmiş / iptal olmuş olabilir
+
+    def update_protection(self, symbol, pos, ids, stop, take_profit):
+        ids = dict(ids or {})
+        new_sl = self._place_stop(symbol, pos, stop)          # önce yeni stop...
+        self._cancel(symbol, ids.get("sl"), trigger=True)      # ...sonra eskisi
+        new = {"sl": new_sl, "tp": ids.get("tp")}
+        if take_profit and take_profit != ids.get("tp_price"):
+            new_tp = self._place_tp(symbol, pos, take_profit)
+            self._cancel(symbol, ids.get("tp"), trigger=not self.tp_limit)
+            new["tp"] = new_tp
+        new["tp_price"] = take_profit
+        return new
 
     def place_limit_entry(self, symbol, side, qty, price):
         # GTX = post-only: emir hemen eşleşecekse borsa reddeder -> her zaman maker olur
@@ -423,6 +459,12 @@ class PaperFutures(FuturesClient):
 
     def place_protection(self, symbol, pos, stop, take_profit):
         self.protect[symbol] = (stop, take_profit)
+        return {"sl": "paper-sl", "tp": "paper-tp" if take_profit else None, "tp_price": take_profit}
+
+    def update_protection(self, symbol, pos, ids, stop, take_profit):
+        if symbol in self.pos:
+            self.protect[symbol] = (stop, take_profit)
+        return {"sl": "paper-sl", "tp": "paper-tp" if take_profit else None, "tp_price": take_profit}
 
     def cancel_protection(self, symbol):
         self.protect.pop(symbol, None)

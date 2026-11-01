@@ -678,3 +678,185 @@ def test_default_config_builds_signal_strategy():
     from bot.strategy import build_strategy
     s = build_strategy(load_config())
     assert isinstance(s, SignalStrategy) and s.primary == "fibonacci" and s.confirm == "volume"
+
+
+# ------------------------------------------------------------------ v0.7.1: kademeli izleyen stop
+TRAIL = {"enabled": True, "step_r": 1.0, "gap_r": 1.0, "move_tp": True}
+
+
+def test_trail_update_long_and_short():
+    rm = RiskManager({**RISK, "trailing": TRAIL}, LEV)
+    # long: giriş 80k, stop 78k, TP 83k
+    assert rm.trail_update(1, 80000, 78000, 83000, 0, 81900) == (0, None, None)
+    assert rm.trail_update(1, 80000, 78000, 83000, 0, 82000) == (1, 80000, 85000)
+    assert rm.trail_update(1, 80000, 78000, 83000, 1, 84100) == (2, 82000, 87000)
+    assert rm.trail_update(1, 80000, 78000, 83000, 2, 83000) == (2, None, None)     # geri gevşemez
+    # short: giriş 100, stop 102.5 (R=2.5), TP 0 (yok)
+    k, st, tp = rm.trail_update(-1, 100, 102.5, 0, 0, 95.0)
+    assert (k, st, tp) == (2, pytest.approx(97.5), 0)
+    assert RiskManager(RISK, LEV).trail_update(1, 80000, 78000, 83000, 0, 90000) == (0, None, None)  # kapalı
+
+
+def test_backtest_trailing_user_example():
+    risk = {**RISK, "take_profit_roe": 0.075, "trailing": TRAIL}      # 2x: stop 78k, TP 83k
+    df = _bars([(80000, 80100, 79900, 80000), (80000, 80100, 79900, 80000),
+                (80050, 80200, 79950, 80100),                         # limit 80k dolar
+                (80100, 82100, 80050, 82000),                         # 82k -> stop 80k, TP 85k
+                (82000, 82500, 79900, 80000)])                        # 80k'den başa baş
+    r = run_backtest(df, _OneShot(1), RiskManager(risk, LEV), 1000, 0.0005, 0.0, maker_fee=0.0002,
+                     entry_order="limit", tp_order="limit")
+    t = r.trades[0]
+    assert (t.init_stop, t.init_tp) == (pytest.approx(78000), pytest.approx(83000))
+    assert (t.stop, t.take_profit, t.steps) == (pytest.approx(80000), pytest.approx(85000), 1)
+    assert t.exit_price == pytest.approx(80000) and t.reason == "başa baş"
+
+
+def test_backtest_trailing_conservative_same_bar():
+    """Aynı mumda hem yeni tepe hem de eski stop'un altı varsa: eski stop'tan çıkılır (temkinli)."""
+    risk = {**RISK, "take_profit_roe": 0, "trailing": TRAIL}
+    df = _bars([(80000, 80100, 79900, 80000), (80000, 80100, 79900, 80000),
+                (80050, 80200, 79950, 80100), (80100, 82500, 77900, 80000)])
+    r = run_backtest(df, _OneShot(1), RiskManager(risk, LEV), 1000, 0.0005, 0.0, maker_fee=0.0002,
+                     entry_order="limit")
+    assert r.trades[0].reason == "stop-loss" and r.trades[0].exit_price == pytest.approx(78000)
+
+
+def test_trader_trailing_paper(tmp_path):
+    src = FakeSource(synthetic_portfolio(COINS, n=1500))
+    risk = {**RISK, "take_profit_roe": 0, "trailing": {**TRAIL, "step_r": 0.5}}
+    paper = PaperFutures(src, 1000, 0.0005, 0.0003, LEV)
+    cfg = _cfg(tmp_path)
+    cfg["risk"] = risk
+    t = Trader(cfg, paper, SmaCrossRsi(**PARAMS), RiskManager(risk, LEV), state_path=tmp_path / "s.json")
+    last_stop, raised = {}, 0
+    for i in range(200, 1499):
+        src.i = i
+        if not t.step():
+            break
+        for sym, p in t.positions.items():
+            key = (sym, p["entry"], p["side"], p["init_stop"])     # pozisyonu benzersiz tanımlar
+            prev = last_stop.get(key)
+            if prev is not None:
+                assert (p["stop"] >= prev) if p["side"] == LONG else (p["stop"] <= prev)   # stop geri gitmez
+                raised += p["stop"] != prev
+            last_stop[key] = p["stop"]
+            assert paper.protect[sym][0] == pytest.approx(p["stop"])                     # borsadaki stop = durum
+    reasons = {x["reason"] for x in t.state["trades"]}
+    assert raised > 0 and ({"izleyen stop", "başa baş"} & reasons)
+
+
+class _RecCcxt:
+    def __init__(self):
+        self.log, self.n = [], 0
+
+    def create_order(self, symbol, type_, side, qty, price=None, params=None):
+        self.n += 1
+        kind = "sl" if params and "stopLossPrice" in params else "tp"
+        self.log.append(("create", kind, (params or {}).get("stopLossPrice", price)))
+        return {"id": f"o{self.n}"}
+
+    def cancel_order(self, oid, symbol, params=None):
+        self.log.append(("cancel", oid, bool(params and params.get("trigger"))))
+
+    def amount_to_precision(self, s, q): return q
+    def price_to_precision(self, s, p): return p
+
+
+def test_update_protection_places_new_before_cancel():
+    c = FuturesExchange.__new__(FuturesExchange)
+    c.ex, c.tp_limit = _RecCcxt(), True
+    pos = Position(LONG, 0.01, 80000)
+    ids = c.place_protection("BTC/USDT:USDT", pos, 78000, 83000)
+    c.ex.log.clear()
+    new = c.update_protection("BTC/USDT:USDT", pos, ids, 80000, 85000)
+    kinds = [(a, b) for a, b, _ in c.ex.log]
+    assert kinds == [("create", "sl"), ("cancel", ids["sl"]), ("create", "tp"), ("cancel", ids["tp"])]
+    assert c.ex.log[1][2] is True and c.ex.log[3][2] is False          # stop = koşullu emir, TP = limit
+    assert new["sl"] != ids["sl"] and new["tp_price"] == 85000
+
+
+# ------------------------------------------------------------------ v0.7.2: kısmi kâr-al
+PARTIAL = {"enabled": True, "at_r": 1.0, "fraction": 0.5, "lock_r": 0.5, "step_r": 0.5, "gap_r": 1.0}
+
+
+def test_runner_stop_rules():
+    rm = RiskManager({**RISK, "partial": PARTIAL}, LEV)
+    assert rm.partial_target(1, 80000, 78000) == pytest.approx(82000)
+    assert rm.runner_stop(1, 80000, 78000, 78000, 82000) == pytest.approx(81000)   # taban: giriş + 0.5R
+    assert rm.runner_stop(1, 80000, 78000, 81000, 84100) == pytest.approx(82000)
+    assert rm.runner_stop(1, 80000, 78000, 82000, 83000) is None                   # geri gelmez
+    assert rm.runner_stop(-1, 100, 102, 102, 96) == pytest.approx(98)              # short: 96 + 1R
+
+
+def test_backtest_partial_user_example():
+    risk = {**RISK, "partial": PARTIAL}
+    df = _bars([(80000, 80100, 79900, 80000), (80000, 80100, 79900, 80000), (80050, 80200, 79950, 80100),
+                (80100, 82100, 81100, 82000), (82000, 84100, 81500, 84000), (84000, 84200, 81900, 82000)])
+    r = run_backtest(df, _OneShot(1), RiskManager(risk, LEV), 1000, 0.0005, 0.0, maker_fee=0.0002,
+                     entry_order="limit", tp_order="limit")
+    a, b = r.trades
+    assert a.reason == "kısmi kâr-al" and a.exit_price == pytest.approx(82000) and a.part == "kısmi"
+    assert b.reason == "izleyen stop" and b.exit_price == pytest.approx(82000)
+    assert a.qty == pytest.approx(b.qty)
+    assert r.equity.iloc[-1] == pytest.approx(1000 + a.pnl + b.pnl)
+
+
+def test_backtest_partial_same_bar_is_conservative():
+    risk = {**RISK, "partial": PARTIAL}
+    df = _bars([(80000, 80100, 79900, 80000), (80000, 80100, 79900, 80000), (80050, 80200, 79950, 80100),
+                (80100, 82100, 80050, 82000), (82000, 84100, 81500, 84000)])
+    r = run_backtest(df, _OneShot(1), RiskManager(risk, LEV), 1000, 0.0005, 0.0, maker_fee=0.0002,
+                     entry_order="limit", tp_order="limit")
+    assert [t.reason for t in r.trades] == ["kısmi kâr-al", "izleyen stop"]
+    assert r.trades[1].exit_price == pytest.approx(81000)          # aynı mumda yeni stop'un altı görüldü
+
+
+def test_live_refuses_partial(tmp_path):
+    src = FakeSource(synthetic_portfolio(COINS, n=400))
+    with pytest.raises(RuntimeError):
+        Trader(_cfg(tmp_path), PaperFutures(src, 1000, 0.0005, 0.0003, LEV), SmaCrossRsi(**PARAMS),
+               RiskManager({**RISK, "partial": PARTIAL}, LEV), state_path=tmp_path / "s.json")
+
+
+# ------------------------------------------------------------------ v0.8: sinyal stratejisine trend filtreleri
+def test_signal_trend_filters_respect_direction():
+    from bot.signals import htf_trend
+    df = synthetic_ohlcv(n=4000, seed=7)
+    s = SignalStrategy("fibonacci", None, use_htf=True, htf_mode="strict")
+    out = s.generate(df)
+    base = SignalStrategy("fibonacci", None).generate(df)
+    assert 0 < out["long_entry"].sum() + out["short_entry"].sum() < base["long_entry"].sum() + base["short_entry"].sum()
+    assert (out.loc[out["long_entry"], "htf_dir"] == 1).all()
+    assert (out.loc[out["short_entry"], "htf_dir"] == -1).all()
+    loose = htf_trend(df, {**s.params, "htf_mode": "loose"})["dir"]
+    strict = htf_trend(df, s.params)["dir"]
+    assert ((strict != 0) <= (loose != 0)).all()                    # katı tanım gevşeğin alt kümesi
+
+
+def test_signal_btc_filter_and_flags():
+    df, btc = synthetic_ohlcv(n=3000, seed=7), synthetic_ohlcv(n=3000, seed=8)
+    s = SignalStrategy("fibonacci", None, use_btc_filter=True)
+    assert s.uses_btc and not SignalStrategy().uses_btc
+    out = s.generate(df, btc)
+    assert (out.loc[out["long_entry"], "btc_dir"] != -1).all()
+    assert (out.loc[out["short_entry"], "btc_dir"] != 1).all()
+
+
+def test_signal_filters_no_lookahead():
+    df, btc = synthetic_ohlcv(n=2000, seed=3), synthetic_ohlcv(n=2000, seed=4)
+    s = SignalStrategy(use_regime=True, use_htf=True, use_btc_filter=True)
+    cut = 1500
+    a = s.generate(df.iloc[:cut], btc.iloc[:cut])
+    b, bb = df.copy(), btc.copy()
+    b.iloc[cut:, :5] *= 1.5
+    bb.iloc[cut:, :5] *= 0.6
+    x = s.generate(b, bb).iloc[:cut]
+    for c in ("long_entry", "short_entry", "long_exit", "short_exit"):
+        assert (a[c].values == x[c].values).all()
+
+
+def test_default_config_has_strict_htf():
+    from bot.config import load_config
+    from bot.strategy import build_strategy
+    s = build_strategy(load_config())
+    assert s.params["use_htf"] and s.params["htf_mode"] == "strict" and not s.params["use_btc_filter"]

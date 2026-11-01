@@ -1,4 +1,4 @@
-# Finans İşlem Botu (Binance Futures, v0.7)
+# Finans İşlem Botu (Binance Futures, v0.8.1)
 
 Binance **global USDⓈ-M Futures** üzerinde, **isolated marjin** ve düşük kaldıraçla (varsayılan 2x)
 **long ve short** yönlü, **10 coin** üzerinde otomatik işlem yapan bot:
@@ -38,11 +38,29 @@ python -m pytest -q                # testler (internet gerekmez)
 | `python main.py report` | Ara rapor üretir (`reports/` klasörüne) |
 | `python main.py resume` | Devre kesiciyle duran botu yeniden etkinleştirir |
 
-## Varsayılan strateji (v0.7): Fibonacci + hacim onayı (`strategy.name: signal`)
+## Varsayılan strateji (v0.8): Fibonacci + hacim onayı + 4 saatlik trend filtresi (`strategy.name: signal`)
 
 - **Giriş (Fibonacci):** Son 72 mumun salınımında fiyat 0.5–0.786 "altın bölgeye" geri çekilip 0.5 seviyesinin
   üstüne (yükselişte) / altına (düşüşte) geri döndüğünde.
 - **Onay (hacim):** Sinyal mumunun hacmi 20 mumluk ortalamanın 1.5 katı olmalı.
+- **Trend filtresi (v0.8):** LONG sadece 4 saatlikte fiyat > EMA21 > EMA55 iken, SHORT sadece fiyat < EMA21 < EMA55 iken.
+
+v0.8 trend filtresi testi (10 coin, 1 yıl; eğitim %70 / test %30):
+
+| | Eğitim KF | Test KF | Yıllık getiri | Maks. düşüş | İşlem başı ort. |
+|---|---|---|---|---|---|
+| Fib + hacim (v0.7) | 1.28 | 1.03 | +32.5% | −18.2% | 0.94 USDT |
+| **+ 4s yön, katı (v0.8)** | **1.38** | **1.33** | +23.3% | **−9.5%** | **1.44 USDT** |
+| + 4s yön, gevşek (EMA21>EMA55) | 1.15 | 0.98 | +9.8% | −13.3% | |
+| + ADX ≥ 20 | 1.09 | 1.70 | +21.4% | −11.9% | |
+| + BTC yönü | 1.20 | 0.90 | +11.8% | −20.0% | |
+| + ADX + 4s katı + BTC | 0.97 | 1.94 | +6.6% | −9.9% | |
+
+Sağlamlık: Eğitim KF her ayarda (EMA 13/34–34/89, 2s–8s, Fib 48–120) 1.32–1.55 (hep v0.7'nin üstünde);
+test KF ise ayara duyarlı (sadece 21/55 ve 20/50, 4s'te 1.33; diğerlerinde 0.85–0.93 — test döneminde sadece ~47
+işlem var). Piyasa emriyle bile her iki dönem kârlı (1.16 / 1.19). Kâr ağırlıkla long'dan: long +291, short −57 USDT.
+Getiri / düşüş oranı 1.79 → 2.47. Aynı düşüşte daha fazla getiri için `margin_per_trade_pct` artırılabilir:
+%30 teminat (+ `max_total_margin_pct: 0.90`) → yıllık +36%, maks. düşüş −14%.
 - **Çıkış:** Stop-loss / kâr-al (borsada) veya Fibonacci'nin ters yönde sinyali.
 
 Nasıl seçildi (`python main.py indicators --pairs`, 10 coin, 1s, Kas 2025 – Kas 2026, limit emirle):
@@ -92,6 +110,65 @@ yalnızca en sonda doğrulama içindir.
 
 Backtest notu: Eğitim/test dönemleri tek bir simülasyondan kesilir; böylece test dönemi başında
 göstergeler (ör. 4s EMA55, ADX) önceki veriyle ısınmış olur.
+
+## Paper (sanal para) canlı test planı — v0.8.1
+
+Ayarlar: `mode: paper`, `live.capital: 1000` (sanal), teminat/işlem %30, toplam teminat ≤ %90, stop ve kâr-al
+teminatın %5'i (2x'te fiyatın %2.5'i), stop başına kayıp ≈ bakiyenin %1.5'i, devre kesici %10.
+
+Backtest beklentisi (aynı ayarlarla, 1 yıl): yıllık +36%, maks. düşüş −14%, **ayda ~14 işlem**, kazanma %56,
+kâr faktörü 1.35, ort. kazanç +15.2 / ort. kayıp −14.5 USDT. Canlı bot gerçek veri üzerinde tekrar oynatıldığında
+verdiği emirlerin tamamı (15/15) backtest sinyalleriyle aynı çıktı.
+
+Süre ve değerlendirme (en az 3–4 hafta, tercihen ≥ 30 işlem):
+
+| Ölçüt | İyi | Dikkat | Dur ve incele |
+|---|---|---|---|
+| Kâr faktörü | ≥ 1.2 | 1.0 – 1.2 | < 1.0 |
+| Kazanma oranı | ≥ %52 | %45 – 52 | < %45 |
+| Düşüş | < %8 | %8 – 10 | devre kesici |
+| Limit emir dolma oranı | ≥ %70 | %50 – 70 | < %50 |
+
+İzleme: `python main.py status` (günlük), `python main.py report` (haftalık), `logs/bot.log`.
+Kısa vadede (20–30 işlem) sonuçlar şansa çok bağlıdır; 3 kötü gün stratejinin bozulduğu anlamına gelmez.
+
+## Kademeli izleyen stop (config.yaml → risk.trailing) — varsayılan KAPALI
+
+Fiyat her `step_r` x R lehe gittiğinde stop, ulaşılan seviyenin `gap_r` x R gerisine çekilir (R = ilk stop mesafesi);
+`move_tp` açıksa kâr-al da aynı miktar ileri taşınır. Örnek (long, 2x): giriş 80k, stop 78k, kâr-al 83k →
+82k'de stop 80k (başa baş) ve kâr-al 85k → 84k'de stop 82k ve kâr-al 87k ... Canlıda stop emri borsada güncellenir:
+önce yeni emir konur, sonra eskisi iptal edilir. Backtest temkinlidir: bir mum içinde önce eski stop kontrol edilir.
+
+Fibonacci + hacim stratejisinde (1 yıl, 10 coin) sonucu **kötüleştirdi**:
+
+| Çıkış | Eğitim KF | Test KF | Yıllık getiri |
+|---|---|---|---|
+| Kâr-al 1R, izleyen yok (varsayılan) | 1.28 | 1.03 | +32.5% |
+| Kâr-al 1.5R + her 1R'de stop/kâr-al 1R yukarı | 1.13 | 0.88 | +7.8% |
+| Kâr-al yok + her 1R'de stop 1R yukarı | 1.07 | 0.96 | +5.0% |
+
+Neden: fiyat 1R gidip stop girişe çekildikten sonra sık sık girişe geri dönüyor; eskiden +1R kazanç olan işlemler
+"başa baş" kapanıyor. Fibonacci tepkisi kısa bir sıçrama yakalıyor; trend takip eden stratejilerde işe yarayabilir.
+
+## Kısmi kâr-al (config.yaml → risk.partial) — sadece backtest, varsayılan KAPALI
+
+Fiyat `at_r` x R lehe gidince pozisyonun `fraction` kadarı (limit emirle) kapanır; kalan kısmın stop'u girişin
+`lock_r` x R ÜSTÜNE çekilir (kalan kısım artık zararla kapanamaz) ve fiyat her `step_r` x R ilerledikçe stop,
+ulaşılan seviyenin `gap_r` x R gerisine taşınır; kalan kısımda kâr-al yoktur.
+Örnek (long, 2x): giriş 80k, stop 78k → 82k'de yarısı kapanır, stop 81k → 84k'de stop 82k → 86k'de 84k ...
+
+Fibonacci + hacimde (1 yıl, 10 coin) mevcut "tamamı 1R'de" kuralından kötü çıktı. Backtest bir mum içinde
+tepe/dip sırasını bilemediği için iki varsayımla ölçüldü:
+
+| Kural | Eğitim KF (temkinli / iyimser) | Test KF (temkinli / iyimser) |
+|---|---|---|
+| Tamamı 1R'de (varsayılan) | 1.28 | 1.03 |
+| Yarısı 1R; kalan stop +0.5R, 0.5R adım | 1.02 / 1.19 | 0.96 / 1.03 |
+| Yarısı 1R; kalan stop +0.25R | 1.06 / 1.18 | 1.00 / 1.05 |
+| Yarısı 1.5R; kalan stop +0.5R | 1.08 / 1.13 | 1.00 / 1.04 |
+
+Kalan yarı ortalama ~+5 USDT kazandırıyor; bu, o yarıyı 1R'de kapatmakla aynı. Canlı bot bu özellik açıkken
+başlamayı reddeder (backtest ile canlı farklı davranmasın diye).
 
 ## Emir tipleri ve ücretler (config.yaml → execution)
 

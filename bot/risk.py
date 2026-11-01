@@ -7,6 +7,7 @@ Terimler:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .config import ROOT
@@ -74,6 +75,72 @@ class RiskManager:
         if (side == LONG and stop <= liq) or (side == SHORT and stop >= liq) or stop <= 0:
             return None
         return TradePlan(side, qty, margin, stop, tp, liq)
+
+    # ------------------------------------------------------------ kademeli izleyen stop
+    @property
+    def trailing(self) -> dict | None:
+        t = self.c.get("trailing") or {}
+        return t if t.get("enabled") else None
+
+    def trail_update(self, side: int, entry: float, init_stop: float, init_tp: float,
+                     steps_done: int, peak: float) -> tuple[int, float | None, float | None]:
+        """Kademeli izleyen stop.
+
+        R = ilk stop mesafesi. Fiyat girişten her `step_r` x R lehe gittiğinde (kademe k):
+            stop = giriş + (k x step_r - gap_r) x R          (asla geri gevşemez)
+            kâr-al = ilk kâr-al + k x step_r x R             (move_tp açıksa; kâr-al yoksa yok)
+        Örnek (long, giriş 80k, stop 78k -> R = 2k, step_r = gap_r = 1):
+            82k'ye çıkınca (k=1) stop 80k (başa baş), 84k'de (k=2) stop 82k, ...
+        Dönüş: (yeni kademe, yeni stop, yeni kâr-al) — kademe değişmediyse (steps_done, None, None).
+        """
+        t = self.trailing
+        if not t:
+            return steps_done, None, None
+        R = abs(entry - init_stop)
+        move = side * (peak - entry)
+        if R <= 0 or move <= 0:
+            return steps_done, None, None
+        step, gap = float(t.get("step_r", 1.0)), float(t.get("gap_r", 1.0))
+        k = int(math.floor(move / (step * R) + 1e-12))
+        if k <= steps_done:
+            return steps_done, None, None
+        stop = entry + side * (k * step - gap) * R
+        stop = max(stop, init_stop) if side == LONG else min(stop, init_stop)
+        tp = init_tp + side * k * step * R if (init_tp and t.get("move_tp", True)) else init_tp
+        return k, stop, tp
+
+    # ------------------------------------------------------------ kısmi kâr-al + koşan yarı
+    @property
+    def partial(self) -> dict | None:
+        p = self.c.get("partial") or {}
+        return p if p.get("enabled") else None
+
+    def partial_target(self, side: int, entry: float, init_stop: float) -> float:
+        """Kısmi kâr-al fiyatı: girişten at_r x R lehe."""
+        R = abs(entry - init_stop)
+        return entry + side * float(self.partial.get("at_r", 1.0)) * R
+
+    def runner_stop(self, side: int, entry: float, init_stop: float, current_stop: float,
+                    peak: float) -> float | None:
+        """Kısmi kâr-al'dan sonra kalan yarının stop'u.
+
+        Taban: giriş + lock_r x R (girişin ÜSTÜNDE -> kalan yarı da zararla kapanamaz).
+        Fiyat her step_r x R ilerledikçe stop, ulaşılan seviyenin gap_r x R gerisine çekilir.
+        Örnek (long, giriş 80k, R=2k, lock 0.5, step 0.5, gap 1): kısmi 82k'de -> stop 81k;
+        84k'de stop 82k; 86k'de 84k ...  Stop asla geri gelmez. Değişmediyse None döner.
+        """
+        pc = self.partial
+        R = abs(entry - init_stop)
+        if R <= 0:
+            return None
+        lock = entry + side * float(pc.get("lock_r", 0.5)) * R
+        step, gap = float(pc.get("step_r", 0.5)), float(pc.get("gap_r", 1.0))
+        move = side * (peak - entry)
+        k = int(math.floor(move / (step * R) + 1e-12)) if move > 0 else 0
+        trail = entry + side * (k * step - gap) * R
+        new = max(lock, trail) if side == LONG else min(lock, trail)
+        better = new > current_stop + 1e-12 if side == LONG else new < current_stop - 1e-12
+        return new if better else None
 
     def drawdown_hit(self, baseline: float, equity: float) -> bool:
         """DEVRE KESİCİ: son başlatmadaki bakiyeye göre kayıp max_drawdown_pct'e ulaştı mı?"""

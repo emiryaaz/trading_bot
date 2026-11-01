@@ -241,13 +241,39 @@ COMMON_PAIRS = {
 }
 
 
+TREND_DEFAULTS = {
+    "use_regime": False, "adx_min": 20, "adx_period": 14,       # 4s ADX >= adx_min değilse işlem yok
+    "use_htf": False, "htf": "4h", "htf_fast": 21, "htf_slow": 55,
+    "htf_mode": "loose",                                         # strict: fiyat>EMA21>EMA55 | loose: EMA21>EMA55
+    "use_btc_filter": False,                                     # altcoinde BTC'nin 4s yönü ters olmamalı
+}
+
+
+def htf_trend(df: pd.DataFrame, p: dict) -> pd.DataFrame:
+    """Üst zaman diliminde (geleceği görmeden) yön ve ADX. dir: +1 / -1 / 0."""
+    def fn(h):
+        c = h["close"]
+        f, s = ind.ema(c, p["htf_fast"]), ind.ema(c, p["htf_slow"])
+        if p.get("htf_mode", "loose") == "strict":
+            d = np.where((c > f) & (f > s), 1, np.where((c < f) & (f < s), -1, 0))
+        else:
+            d = np.where(f > s, 1, np.where(f < s, -1, 0))
+        d = np.where(s.notna(), d, 0)
+        return pd.DataFrame({"dir": d, "adx": ind.adx(h, p["adx_period"])}, index=h.index)
+    t = ind.higher_timeframe(df, p["htf"], fn)
+    t["dir"] = t["dir"].fillna(0)
+    return t
+
+
 class SignalStrategy(Strategy):
-    """Tek bir indikatörün klasik kuralıyla işlem; isteğe bağlı olarak bir onay indikatörüyle."""
+    """Tek bir indikatörün klasik kuralıyla işlem; isteğe bağlı olarak bir onay indikatörü ve
+    trend filtreleri (ADX rejimi, 4 saatlik yön, BTC yönü) ile."""
 
     def __init__(self, primary: str = "fibonacci", confirm: str | None = "volume", atr_period: int = 14,
                  fib_lookback: int = 72, **params):
         super().__init__(primary=primary, confirm=confirm, atr_period=atr_period, fib_lookback=fib_lookback,
-                         **params)
+                         **{**TREND_DEFAULTS, **params})
+        self.uses_btc = bool(self.params["use_btc_filter"])
         if primary not in INDICATORS:
             raise ValueError(f"Bilinmeyen indikatör: {primary}. Seçenekler: {list(INDICATORS)}")
         if confirm and confirm not in CONFIRMS:
@@ -267,6 +293,22 @@ class SignalStrategy(Strategy):
             lok, sok = CONFIRMS[self.confirm][1](out, **self.params)
             long &= lok.fillna(False).astype(bool)
             short &= sok.fillna(False).astype(bool)
+        p = self.params
+        if p["use_regime"] or p["use_htf"]:
+            tr = htf_trend(out, p)
+            out["htf_dir"], out["htf_adx"] = tr["dir"], tr["adx"]
+            if p["use_regime"]:
+                strong = (tr["adx"] >= p["adx_min"]).fillna(False)
+                long &= strong
+                short &= strong
+            if p["use_htf"]:
+                long &= tr["dir"] == 1
+                short &= tr["dir"] == -1
+        if p["use_btc_filter"] and btc is not None:
+            bd = htf_trend(btc.reindex(out.index, method="ffill"), p)["dir"]
+            out["btc_dir"] = bd
+            long &= bd != -1
+            short &= bd != 1
         ready = out["atr"].notna()
         out["long_entry"] = (long & ready).astype(bool)
         out["short_entry"] = (short & ready & ~out["long_entry"]).astype(bool)
@@ -275,7 +317,16 @@ class SignalStrategy(Strategy):
         return out
 
     def describe(self) -> str:
+        p = self.params
         d = INDICATORS[self.primary][1]
         if self.primary == "fibonacci":
-            d += f" ({self.params['fib_lookback']} mum)"
-        return d + (f" + onay: {CONFIRMS[self.confirm][0]}" if self.confirm else "")
+            d += f" ({p['fib_lookback']} mum)"
+        d += f" + onay: {CONFIRMS[self.confirm][0]}" if self.confirm else ""
+        f = []
+        if p["use_regime"]:
+            f.append(f"ADX({p['htf']})>={p['adx_min']}")
+        if p["use_htf"]:
+            f.append(f"{p['htf']} yön ({'fiyat>EMA21>EMA55' if p['htf_mode'] == 'strict' else 'EMA21>EMA55'})")
+        if p["use_btc_filter"]:
+            f.append("BTC yönü")
+        return d + (" | filtreler: " + ", ".join(f) if f else "")

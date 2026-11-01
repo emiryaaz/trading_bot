@@ -42,6 +42,9 @@ class Trader:
     def __init__(self, cfg: dict, exchange: FuturesClient, strategy: Strategy,
                  risk: RiskManager, notifier: Notifier | None = None, state_path: Path | None = None):
         self.cfg, self.ex, self.strategy, self.risk = cfg, exchange, strategy, risk
+        if risk.partial:
+            raise RuntimeError("risk.partial (kısmi kâr-al) şu an yalnızca backtest'te destekleniyor; canlı / paper "
+                               "için config.yaml'da partial.enabled: false yapın.")
         self.symbols = [futures_symbol(s) for s in cfg["exchange"]["symbols"]]
         self.tf = cfg["exchange"]["timeframe"]
         self.capital = float(cfg["live"]["capital"])
@@ -146,7 +149,15 @@ class Trader:
         res = self.ex.closed_result(sym, p["side"], p["opened_ms"], p["entry_fee"])
         exit_px = res.exit_price if res else price
         near_tp = p["take_profit"] and abs(exit_px - p["take_profit"]) < abs(exit_px - p["stop"])
-        reason = "kâr-al" if near_tp else "stop-loss"
+        locked = (p["stop"] - p["entry"]) * p["side"]
+        if near_tp:
+            reason = "kâr-al"
+        elif locked > 1e-12:
+            reason = "izleyen stop"
+        elif p.get("steps"):
+            reason = "başa baş"
+        else:
+            reason = "stop-loss"
         if res:
             self._record(sym, exit_px, res.pnl, res.fees, res.funding, reason)
         else:
@@ -161,11 +172,12 @@ class Trader:
         tp = self.ex.round_price(sym, tp) if tp else 0.0
         self.positions[sym] = {"side": side, "qty": qty, "entry": price, "entry_fee": fee,
                                "margin": qty * price / self.lev, "stop": stop, "take_profit": tp,
+                               "init_stop": stop, "init_tp": tp, "steps": 0, "peak": price, "prot": None,
                                "opened": _now(), "opened_ms": opened_ms}
         self._ex_pos[sym] = Position(side, qty, price)
         self.save()                                    # pozisyon bilgisini hemen diske yaz
         try:
-            self.ex.place_protection(sym, Position(side, qty, price), stop, tp)
+            self.positions[sym]["prot"] = self.ex.place_protection(sym, Position(side, qty, price), stop, tp)
         except Exception as e:
             self.log.exception(f"{sym}: stop / kâr-al emri konamadı!")
             self.notify.send(f"UYARI: {sym} koruma emri konamadı ({e}). Pozisyon güvenlik için kapatılıyor.")
@@ -236,6 +248,34 @@ class Trader:
         fill = self.ex.open_position(sym, side, qty)
         self._adopt(sym, side, fill.qty, fill.price, fill.fee, atr, opened_ms, "piyasa")
 
+    def _trail(self, prices: dict) -> None:
+        """Kademeli izleyen stop: fiyat lehe gittikçe stop'u (ve kâr-al'ı) borsada yukarı taşı."""
+        if not self.risk.trailing:
+            return
+        for sym, p in self.positions.items():
+            px = prices.get(sym)
+            if px is None or sym not in self._ex_pos:
+                continue
+            side = p["side"]
+            p["peak"] = max(p.get("peak", p["entry"]), px) if side == LONG else min(p.get("peak", p["entry"]), px)
+            k, ns, ntp = self.risk.trail_update(side, p["entry"], p.get("init_stop", p["stop"]),
+                                                p.get("init_tp", p["take_profit"]), p.get("steps", 0), p["peak"])
+            if ns is None:
+                continue
+            ns = self.ex.round_price(sym, ns)
+            ntp = self.ex.round_price(sym, ntp) if ntp else 0.0
+            try:
+                p["prot"] = self.ex.update_protection(sym, Position(side, p["qty"], p["entry"]), p.get("prot"),
+                                                      ns, ntp)
+            except Exception as e:                      # yeni emir konamadıysa eski stop yerinde kalır
+                self.log.warning(f"{sym}: stop güncellenemedi ({e}); eski stop geçerli.")
+                continue
+            old = p["stop"]
+            p.update(steps=k, stop=ns, take_profit=ntp)
+            self.save()
+            self.notify.send(f"STOP YÜKSELTİLDİ {sym.split(':')[0]} {_name(side)} | kademe {k} | stop {old:g} → {ns:g}"
+                             + (f" | kâr-al {ntp:g}" if ntp else ""))
+
     def _close_all(self, reason: str) -> None:
         self._cancel_all_pending()
         for sym in list(self.positions):
@@ -274,6 +314,7 @@ class Trader:
             if sym not in self._ex_pos:
                 self._on_exchange_close(sym, prices.get(sym, self.positions[sym]["entry"]))
         foreign = {s for s in self._ex_pos if s not in self.positions and s not in self.pending}
+        self._trail(prices)
         for s in foreign - set(st["warned_foreign"]):
             self.notify.send(f"UYARI: Hesapta {s} için botun açmadığı bir pozisyon var. "
                              "Bot ona dokunmaz ve o kapanana kadar bu coinde işlem açmaz.")

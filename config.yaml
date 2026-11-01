@@ -44,6 +44,15 @@ strategy:
     confirm: volume          # onay: sinyal mumunda hacim 20 mumluk ortalamanın 1.5 katı
     fib_lookback: 72         # salınımın arandığı mum sayısı
     atr_period: 14
+    # --- trend filtreleri (v0.8)
+    use_htf: true            # sadece 4 saatlik trend yönünde işlem: LONG için 4s'te fiyat > EMA21 > EMA55,
+    htf: 4h                  #   SHORT için fiyat < EMA21 < EMA55
+    htf_fast: 21
+    htf_slow: 55
+    htf_mode: strict         # strict: fiyat>EMA21>EMA55 | loose: sadece EMA21>EMA55 (testte daha kötüydü)
+    use_regime: false        # 4s ADX >= adx_min şartı (testte sonucu kötüleştirdi)
+    adx_min: 20
+    use_btc_filter: false    # altcoinde BTC'nin 4s yönü ters olmamalı (testte sonucu kötüleştirdi)
     # Seçenekler (python main.py indicators ile hepsinin sonucunu görün):
     #   primary: ema_cross ema200 macd rsi stoch bollinger bollinger_break dmi supertrend psar
     #            ichimoku donchian cci mfi obv vwap fibonacci volume
@@ -92,16 +101,30 @@ multi_factor_params:
     atr_period: 14
 
 risk:
-  margin_per_trade_pct: 0.20  # her işlemde bot bakiyesinin %20'si teminat olur (2x ile pozisyon = bakiyenin %40'ı)
-                              # => %5 teminat zararı = bot bakiyesinin %1'i
+  margin_per_trade_pct: 0.30  # her işlemde bot bakiyesinin %30'u teminat olur (2x ile pozisyon = bakiyenin %60'ı)
+                              # => %5 teminat zararı (stop) = bot bakiyesinin %1.5'i
   max_open_positions: 3       # aynı anda en fazla kaç coinde pozisyon açık olabilir
-  max_total_margin_pct: 0.60  # tüm açık pozisyonların toplam teminatı bakiyenin en fazla %60'ı
+  max_total_margin_pct: 0.90  # tüm açık pozisyonların toplam teminatı bakiyenin en fazla %90'ı (3 x %30)
   stop_mode: roe              # roe = teminatın yüzdesi | atr = oynaklığa göre (karşılaştırma için)
   stop_loss_roe: 0.05         # teminatın %5'i zararda kapat  (2x'te fiyatın %2.5'i)
   take_profit_roe: 0.05       # teminatın %5'i kârda kapat   (0 = kapalı)
   stop_atr_mult: 2.0          # sadece stop_mode: atr iken: stop = giriş -/+ 2 x ATR
   take_profit_atr_mult: 4.0   # sadece stop_mode: atr iken (0 = kapalı)
   risk_per_trade_pct: 0.01    # sadece stop_mode: atr iken: stop'ta kayıp = bakiyenin %1'i (boyut buna göre)
+  trailing:                   # KADEMELİ İZLEYEN STOP (R = ilk stop mesafesi)
+    enabled: false            # Fibonacci+hacim stratejisinde sonucu kötüleştirdi (bkz. README) -> kapalı
+    step_r: 1.0               # fiyat her 1R lehe gittiğinde...
+    gap_r: 1.0                # ...stop, ulaşılan seviyenin 1R gerisine çekilir (ilk kademede = giriş fiyatı)
+    move_tp: true             # kâr-al da her kademede 1R ileri taşınır (take_profit_roe: 0 ise kâr-al yok)
+    # Örnek (long, 2x): giriş 80k, stop 78k (R=2k). 82k'de stop 80k, 84k'de stop 82k, ...
+  partial:                    # KISMİ KÂR-AL (sadece backtest) — R = ilk stop mesafesi
+    enabled: false            # Fibonacci+hacimde sonucu kötüleştirdi (bkz. README) -> kapalı
+    at_r: 1.0                 # fiyat 1R lehe gidince pozisyonun...
+    fraction: 0.5             # ...yarısı kapanır (limit / maker)
+    lock_r: 0.5               # kalan yarının stop'u girişin 0.5R ÜSTÜNE çekilir (zararla kapanamaz)
+    step_r: 0.5               # fiyat her 0.5R ilerledikçe...
+    gap_r: 1.0                # ...stop, ulaşılan seviyenin 1R gerisine çekilir; kalan yarıda kâr-al yok
+    # Örnek (long, 2x): giriş 80k, stop 78k. 82k'de yarısı kapanır, stop 81k; 84k'de stop 82k; 86k'de 84k ...
   max_drawdown_pct: 0.10      # DEVRE KESİCİ: son başlatmaya göre %10 kayıpta dur + rapor ver
   max_daily_loss_pct: 0.03    # gün içinde %3 kayıpta o gün yeni işlem açma (0 = kapalı)
   kill_switch_file: STOP      # proje klasöründe "STOP" adlı dosya varsa pozisyonu kapatıp dur
@@ -111,6 +134,8 @@ backtest:
   days: 365                  # kaç günlük geçmiş veri
 
 live:
-  capital: 100               # botun kullanmasına izin verdiğin USDT (hesabın tamamı değil)
+  capital: 1000              # botun kullanmasına izin verdiğin USDT (hesabın tamamı değil).
+                             # paper modda sanal başlangıç bakiyesi; gerçeğe geçmeden önce kendi tutarınızı yazın
+                             # ve "python main.py info" ile her coinin minimum işlem büyüklüğünü kontrol edin.
   poll_seconds: 30           # kaç saniyede bir kontrol edilsin
   state_file: data/state.json

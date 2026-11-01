@@ -39,6 +39,11 @@ class Trade:
     exit_fee: float = 0.0
     funding: float = 0.0      # ödenen (+) / alınan (-) funding toplamı
     reason: str = ""
+    init_stop: float = 0.0    # izleyen stop için ilk seviyeler
+    init_tp: float = 0.0
+    steps: int = 0            # ulaşılan kademe sayısı
+    partial_done: bool = False  # kısmi kâr-al gerçekleşti mi (kalan yarı "koşuyor")
+    part: str = ""            # "kısmi" = pozisyonun kısmi kâr-al ile kapanan parçası
 
     @property
     def gross(self) -> float:
@@ -188,7 +193,7 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
                  funding_fallback: float = 0.0001, bars_per_year: float = 8760,
                  maker_fee: float | None = None, entry_order: str = "market",
                  limit_offset_atr: float = 0.0, limit_ttl_bars: int = 1,
-                 tp_order: str = "market") -> BacktestResult:
+                 tp_order: str = "market", same_bar_runner_check: bool = True) -> BacktestResult:
     """fee_rate = taker (piyasa emri) ücreti, maker_fee = limit emir ücreti.
 
     entry_order="limit": sinyal mumunun kapanışında (kapanış -/+ limit_offset_atr x ATR) fiyatına deftere
@@ -246,6 +251,21 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
         cash += t.pnl + t.entry_fee + t.funding     # giriş ücreti ve funding zaten düşülmüştü
         trades.append(t)
 
+    def realize_part(s: _Sym, i: int, t: Trade, frac: float, px: float, maker: bool) -> None:
+        """Pozisyonun `frac` kadarını px'ten kapatır (kısmi kâr-al); kalan pozisyon devam eder."""
+        nonlocal cash
+        q = t.qty * frac
+        part = Trade(t.symbol, t.side, t.entry_time, t.entry_price, q, t.margin * frac, t.stop, px,
+                     t.entry_fee * frac, funding=t.funding * frac, init_stop=t.init_stop, init_tp=t.init_tp,
+                     part="kısmi")
+        fill = px if maker else px * (1 - t.side * slippage)
+        part.exit_fee = fill * q * (maker_fee if maker else taker_fee)
+        part.exit_time, part.exit_price, part.reason = index[i], fill, "kısmi kâr-al"
+        cash += part.pnl + part.entry_fee + part.funding
+        trades.append(part)
+        keep = 1 - frac
+        t.qty, t.margin, t.entry_fee, t.funding = t.qty * keep, t.margin * keep, t.entry_fee * keep, t.funding * keep
+
     def open_pos(s: _Sym, i: int, side: int, px: float, atr: float, maker: bool) -> None:
         nonlocal cash
         used = sum(t.margin for t in pos.values())
@@ -258,9 +278,12 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
         if not maker:
             px = px * (1 + side * slippage)
         stop, tp = risk.protection_prices(px, side, atr)
+        if risk.partial:
+            tp = risk.partial_target(side, px, stop)     # ilk kâr-al = kısmi kâr-al seviyesi
         fee = px * plan.qty * (maker_fee if maker else taker_fee)
         cash -= fee
-        pos[s.name] = Trade(s.name, side, index[i], px, plan.qty, plan.margin, stop, tp, fee)
+        pos[s.name] = Trade(s.name, side, index[i], px, plan.qty, plan.margin, stop, tp, fee,
+                            init_stop=stop, init_tp=tp)
 
     for i in range(len(index)):
         d = index[i].date()
@@ -308,23 +331,58 @@ def run_backtest(data: pd.DataFrame | dict[str, pd.DataFrame], strategy: Strateg
                 elif i >= pe["expires"]:
                     pend_entry.pop(s.name, None)    # dolmadı -> iptal
 
-        # 3) mum içi stop-loss / kâr al
+        # 3) mum içi stop-loss / kâr al, ardından izleyen stop güncellemesi
+        #    Temkinli sıra: önce MEVCUT stop/kâr-al kontrol edilir, stop ancak sonra yükseltilir
+        #    (mum içinde tepe mi dip mi önce geldi bilinemez).
         tp_maker = tp_order == "limit"
         for s in syms:
             t = pos.get(s.name)
             if not t or np.isnan(s.o[i]):
                 continue
             o, h, l = s.o[i], s.h[i], s.l[i]
+            locked = (t.stop - t.entry_price) * t.side          # >0: stop kâr bölgesinde
+            sl_reason = "izleyen stop" if locked > 1e-12 else ("başa baş" if t.steps else "stop-loss")
+            pc = risk.partial
+            if pc and not t.partial_done:
+                # --- kısmi kâr-al aşaması: önce stop, sonra hedef (temkinli sıra)
+                hit_stop = l <= t.stop if t.side == LONG else h >= t.stop
+                hit_tgt = h >= t.take_profit if t.side == LONG else l <= t.take_profit
+                if hit_stop:
+                    close_pos(s, i, min(o, t.stop) if t.side == LONG else max(o, t.stop), sl_reason)
+                    continue
+                if hit_tgt:
+                    fill = max(o, t.take_profit) if t.side == LONG else min(o, t.take_profit)
+                    realize_part(s, i, t, float(pc.get("fraction", 0.5)), fill, tp_maker)
+                    t.partial_done, t.take_profit = True, 0.0
+                    t.stop = t.entry_price + t.side * float(pc.get("lock_r", 0.5)) * abs(t.entry_price - t.init_stop)
+                    # aynı mumda yeni stop'un altına inildiyse kalan yarı da kapanır (temkinli varsayım)
+                    if same_bar_runner_check and ((l <= t.stop) if t.side == LONG else (h >= t.stop)):
+                        close_pos(s, i, t.stop, "izleyen stop")
+                continue
+            if t.partial_done:
+                # --- koşan yarı: sadece (yükselen) stop
+                if (l <= t.stop) if t.side == LONG else (h >= t.stop):
+                    close_pos(s, i, min(o, t.stop) if t.side == LONG else max(o, t.stop), "izleyen stop")
+                else:
+                    ns = risk.runner_stop(t.side, t.entry_price, t.init_stop, t.stop, h if t.side == LONG else l)
+                    if ns is not None:
+                        t.stop = ns
+                continue
             if t.side == LONG:
                 if l <= t.stop:
-                    close_pos(s, i, min(o, t.stop), "stop-loss")
+                    close_pos(s, i, min(o, t.stop), sl_reason)
                 elif t.take_profit and h >= t.take_profit:
                     close_pos(s, i, max(o, t.take_profit), "kâr-al", maker=tp_maker)
             else:
                 if h >= t.stop:
-                    close_pos(s, i, max(o, t.stop), "stop-loss")
+                    close_pos(s, i, max(o, t.stop), sl_reason)
                 elif t.take_profit and l <= t.take_profit:
                     close_pos(s, i, min(o, t.take_profit), "kâr-al", maker=tp_maker)
+            if s.name in pos and risk.trailing:
+                peak = h if t.side == LONG else l
+                k, ns, ntp = risk.trail_update(t.side, t.entry_price, t.init_stop, t.init_tp, t.steps, peak)
+                if ns is not None:
+                    t.steps, t.stop, t.take_profit = k, ns, ntp
 
         for s in syms:
             if not np.isnan(s.c[i]):
