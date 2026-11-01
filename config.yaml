@@ -1,0 +1,54 @@
+# ------------------------------------------------------------
+# Finans İşlem Botu - Ayarlar (Binance USDⓈ-M Futures)
+# ------------------------------------------------------------
+
+# Çalışma modu:
+#   paper   -> Gerçek fiyat verisi, sanal bakiye. Borsaya emir GİTMEZ. (önerilen başlangıç)
+#   testnet -> Binance Futures test ortamına gerçek emir gider, ama test parasıyla.
+#   live    -> GERÇEK PARA. Ayrıca .env içinde ALLOW_LIVE=yes gerekir.
+mode: paper
+
+exchange:
+  name: binanceusdm      # Binance global USDⓈ-M vadeli işlemler (ccxt)
+  symbol: BTC/USDT       # bot içinde otomatik olarak BTC/USDT:USDT (sürekli kontrat) olur
+  timeframe: 1h          # 1m, 5m, 15m, 1h, 4h, 1d
+  fee_rate: 0.0005       # piyasa emri (taker) ücreti %0.05, pozisyon büyüklüğü üzerinden
+  slippage: 0.0003       # %0.03 tahmini kayma
+  testnet_kind: testnet  # testnet = testnet.binancefuture.com anahtarı | demo = demo.binance.com anahtarı
+
+futures:
+  leverage: 2            # kaldıraç çarpanı (1-5 arası izinli)
+  margin_mode: isolated  # isolated: zarar sadece o işlemin teminatıyla sınırlı
+  allow_short: true      # false yaparsan sadece long açar (karşılaştırma için)
+  funding_rate_fallback: 0.0001   # backtest'te gerçek funding verisi yoksa 8 saatlik varsayılan oran
+
+strategy:
+  name: sma_cross_rsi
+  params:
+    fast: 20             # hızlı hareketli ortalama
+    slow: 50             # yavaş hareketli ortalama
+    rsi_period: 14
+    rsi_max_entry: 70    # RSI bunun üstündeyse LONG açma (aşırı alım)
+    rsi_min_entry: 30    # RSI bunun altındaysa SHORT açma (aşırı satım)
+    atr_period: 14
+
+risk:
+  margin_per_trade_pct: 0.20  # her işlemde bot bakiyesinin %20'si teminat olur (2x ile pozisyon = bakiyenin %40'ı)
+                              # => %5 teminat zararı = bot bakiyesinin %1'i
+  stop_mode: roe              # roe = teminatın yüzdesi | atr = oynaklığa göre (karşılaştırma için)
+  stop_loss_roe: 0.05         # teminatın %5'i zararda kapat  (2x'te fiyatın %2.5'i)
+  take_profit_roe: 0.05       # teminatın %5'i kârda kapat   (0 = kapalı)
+  stop_atr_mult: 2.0          # sadece stop_mode: atr iken
+  take_profit_atr_mult: 4.0   # sadece stop_mode: atr iken
+  max_drawdown_pct: 0.10      # DEVRE KESİCİ: son başlatmaya göre %10 kayıpta dur + rapor ver
+  max_daily_loss_pct: 0.03    # gün içinde %3 kayıpta o gün yeni işlem açma (0 = kapalı)
+  kill_switch_file: STOP      # proje klasöründe "STOP" adlı dosya varsa pozisyonu kapatıp dur
+
+backtest:
+  initial_balance: 1000      # USDT
+  days: 365                  # kaç günlük geçmiş veri
+
+live:
+  capital: 100               # botun kullanmasına izin verdiğin USDT (hesabın tamamı değil)
+  poll_seconds: 30           # kaç saniyede bir kontrol edilsin
+  state_file: data/state.json
