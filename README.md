@@ -1,4 +1,4 @@
-# Finans İşlem Botu (Binance Futures, v0.6.1)
+# Finans İşlem Botu (Binance Futures, v0.7)
 
 Binance **global USDⓈ-M Futures** üzerinde, **isolated marjin** ve düşük kaldıraçla (varsayılan 2x)
 **long ve short** yönlü, **10 coin** üzerinde otomatik işlem yapan bot:
@@ -24,6 +24,8 @@ python -m pytest -q                # testler (internet gerekmez)
 |---|---|
 | `python main.py backtest` | 10 coinin futures verisini (mum + funding) indirir, ortak bakiyeyle portföy testi yapar + coin bazında tablo |
 | `python main.py backtest --compare` | Ayar varyasyonlarını yan yana karşılaştırır |
+| `python main.py indicators` | 18 indikatörü tek tek, aynı koşullarla test eder (eğitim / test ayrı) |
+| `python main.py indicators --pairs` | Eğitimde en iyi 5 indikatörü, yaygın önerilen eşleriyle (onay) ikili test eder |
 | `python main.py layers` | Her indikatör katmanının katkısını eğitim ve test dönemi için ayrı ayrı gösterir |
 | `python main.py layers --tf 4h` | Aynı katman testini 4 saatlik mumlarla yapar |
 | `python main.py backtest --refresh` | Veriyi yeniden indirir |
@@ -36,7 +38,33 @@ python -m pytest -q                # testler (internet gerekmez)
 | `python main.py report` | Ara rapor üretir (`reports/` klasörüne) |
 | `python main.py resume` | Devre kesiciyle duran botu yeniden etkinleştirir |
 
-## Strateji: çok katmanlı karar sistemi (`strategy.name: multi_factor`)
+## Varsayılan strateji (v0.7): Fibonacci + hacim onayı (`strategy.name: signal`)
+
+- **Giriş (Fibonacci):** Son 72 mumun salınımında fiyat 0.5–0.786 "altın bölgeye" geri çekilip 0.5 seviyesinin
+  üstüne (yükselişte) / altına (düşüşte) geri döndüğünde.
+- **Onay (hacim):** Sinyal mumunun hacmi 20 mumluk ortalamanın 1.5 katı olmalı.
+- **Çıkış:** Stop-loss / kâr-al (borsada) veya Fibonacci'nin ters yönde sinyali.
+
+Nasıl seçildi (`python main.py indicators --pairs`, 10 coin, 1s, Kas 2025 – Kas 2026, limit emirle):
+18 indikatör tek başına test edildi; hiçbiri iki dönemde birden kârlı değildi. Eğitimde en iyi 5'i (Fibonacci,
+hacim, Bollinger kırılımı, EMA 9/21, Supertrend) yaygın önerilen eşleriyle denendi. Fibonacci'nin 4 eşinden 3'ü
+her iki dönemde de kârlıydı; eğitimde en iyisi hacim onayıydı:
+
+| | Eğitim KF | Test KF | Yıllık getiri | Maks. düşüş |
+|---|---|---|---|---|
+| Fibonacci tek başına | 1.05 | 0.87 | | |
+| **Fibonacci + hacim** | **1.28** | **1.03** | **+32.5%** | **−18%** |
+| Fibonacci + MACD | 1.13 | 1.29 | +28.5% | −21% |
+| Fibonacci + RSI | 1.15 | 1.04 | | |
+
+Sağlamlık: Fibonacci + hacim, salınım süresi 72 / 96 / 120 mumda her iki dönemde kârlı (48'de bozuluyor),
+10 coinin 8'inde kârlı, hem long hem short kazandırıyor. **Uyarı:** piyasa emriyle girilirse test KF 0.95'e
+düşüyor (kârın bir kısmı limit emir tasarrufundan); 24 kombinasyon denendiği için şans payı var.
+Gerçek doğrulama paper / demo hesapta ileriye dönük çalıştırmadır.
+
+Başka bir kombinasyon denemek için `config.yaml → strategy.params` içinde `primary` ve `confirm` değiştirin.
+
+## Alternatif strateji: çok katmanlı karar sistemi (`strategy.name: multi_factor`)
 
 Bir işlem açılması için açık olan **tüm** katmanların onay vermesi gerekir:
 

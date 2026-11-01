@@ -108,13 +108,8 @@ def collect_recent(cfg: dict, ex=None, log=print) -> dict:
         sym = futures_symbol(s)
         for metric in ENDPOINTS:
             path = metric_path(sym, metric)
-            since = earliest
-            if path.exists():
-                try:
-                    last = pd.read_csv(path, index_col=0, parse_dates=True).index.max()
-                    since = max(earliest, int(last.timestamp() * 1000) + 1)
-                except Exception:
-                    pass
+            since = earliest                         # her seferinde tüm pencere: aradaki boşluklar da dolar
+                                                     # (tekrarlar birleştirmede atılır)
             try:
                 df = fetch_metric(ex, sym, metric, since)
                 added = _merge_save(path, df) if len(df) else 0

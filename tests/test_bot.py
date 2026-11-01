@@ -626,3 +626,55 @@ def test_klines_parser_keeps_taker_volume():
     rows = [[1735689600000, "100", "101", "99", "100.5", "10", 1735693199999, "1000", 50, "6", "600", "0"]]
     df = klines_to_df(rows)
     assert df["taker_buy_volume"].iloc[0] == 6 and df["close"].iloc[0] == 100.5
+
+
+# ------------------------------------------------------------------ v0.7: tek / ikili indikatör stratejileri
+from bot.signals import COMMON_PAIRS, CONFIRMS, INDICATORS, SignalStrategy
+
+
+@pytest.mark.parametrize("name", list(INDICATORS))
+def test_indicator_no_lookahead(name):
+    df = synthetic_ohlcv(n=1400, seed=3)
+    cut = 1000
+    s = SignalStrategy(name, None)
+    a = s.generate(df.iloc[:cut])
+    b = df.copy()
+    b.iloc[cut:, :5] *= 1.5
+    bb = s.generate(b).iloc[:cut]
+    for col in ("long_entry", "short_entry", "long_exit", "short_exit"):
+        assert (a[col].values == bb[col].values).all(), (name, col)
+
+
+def test_confirm_filters_and_respects_direction():
+    df = synthetic_ohlcv(n=3000, seed=4)
+    single = SignalStrategy("macd", None).generate(df)
+    paired = SignalStrategy("macd", "ema200").generate(df)
+    assert paired["long_entry"].sum() < single["long_entry"].sum()
+    assert (paired["long_entry"] <= single["long_entry"]).all()       # onay sadece eler, yeni sinyal üretmez
+    ema = paired["close"].ewm(span=200, adjust=False, min_periods=200).mean()
+    assert (paired.loc[paired["long_entry"], "close"] > ema[paired["long_entry"]]).all()
+    assert (paired.loc[paired["short_entry"], "close"] < ema[paired["short_entry"]]).all()
+
+
+def test_all_common_pairs_valid():
+    for p, cs in COMMON_PAIRS.items():
+        assert p in INDICATORS
+        for c in cs:
+            assert c in CONFIRMS
+    df = synthetic_ohlcv(n=600, seed=9)
+    for c in CONFIRMS:                                                 # her onay fonksiyonu çalışmalı
+        SignalStrategy("fibonacci", c).generate(df)
+
+
+def test_fib_lookback_param_changes_signals():
+    df = synthetic_ohlcv(n=3000, seed=4)
+    a = SignalStrategy("fibonacci", None, fib_lookback=48).generate(df)["long_entry"]
+    b = SignalStrategy("fibonacci", None, fib_lookback=120).generate(df)["long_entry"]
+    assert (a != b).any()
+
+
+def test_default_config_builds_signal_strategy():
+    from bot.config import load_config
+    from bot.strategy import build_strategy
+    s = build_strategy(load_config())
+    assert isinstance(s, SignalStrategy) and s.primary == "fibonacci" and s.confirm == "volume"

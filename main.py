@@ -3,7 +3,9 @@
     python main.py backtest              # 10 coin, Binance Futures geçmiş verisiyle portföy testi (+ coin bazında)
     python main.py backtest --compare    # ayar varyasyonlarını karşılaştır (ROE vs ATR, long+short vs long)
     python main.py backtest --synthetic  # internet olmadan, sahte veriyle (sadece kod testi)
-    python main.py layers               # her indikatör katmanının katkısı (eğitim / test ayrı)
+    python main.py indicators           # 18 indikatörü tek tek test et
+    python main.py indicators --pairs   # + en iyi 5'i yaygın önerilen eşleriyle ikili test et
+    python main.py layers               # multi_factor katmanlarının katkısı (eğitim / test ayrı)
     python main.py layers --tf 4h       # aynı test 4 saatlik mumlarla
     python main.py collect              # open interest + long/short oranlarını topla (son 30 gün)
     python main.py collect --archive 365  # + arşivden geçmişi doldurmayı dene
@@ -206,6 +208,57 @@ def cmd_run(cfg):
     _trader(cfg).run()
 
 
+def cmd_indicators(cfg, split, pairs, top):
+    """1) Her indikatörü TEK BAŞINA klasik kuralıyla test eder.
+    2) --pairs: eğitim dönemindeki en iyi `top` indikatörü, piyasada yaygın önerilen eşleriyle (onay) test eder.
+    Risk, emir tipi ve portföy ayarları config'den gelir ve hepsi için aynıdır. Seçim EĞİTİM dönemine göre yapılır."""
+    from bot.signals import COMMON_PAIRS, CONFIRMS, INDICATORS, SignalStrategy
+    data, funding = load_history(cfg)
+    idx = sorted(set().union(*[d.index for d in data.values()]))
+    cut = idx[int(len(idx) * split)]
+    print(f"{len(data)} coin | eğitim {idx[0]:%Y-%m-%d} → {cut:%Y-%m-%d} | test {cut:%Y-%m-%d} → {idx[-1]:%Y-%m-%d}")
+    lb = cfg["strategy"].get("params", {}).get("fib_lookback", 72)
+
+    def row(p, c):
+        res = _bt(cfg, data, funding, SignalStrategy(p, c, fib_lookback=lb))
+        tr, te = res.subset(None, cut).metrics(), res.subset(cut).metrics()
+        n = lambda m: int(m["İşlem sayısı (long/short)"].split()[0])
+        return {"Giriş": INDICATORS[p][1], "Onay": CONFIRMS[c][0] if c else "— (tek başına)", "kod": p, "onay_kod": c or "",
+                "Eğitim getiri %": tr["Toplam getiri %"], "Eğitim DD %": tr["Maks. düşüş (drawdown) %"],
+                "Eğitim işlem": n(tr), "Eğitim KF": tr["Kâr faktörü"],
+                "| Test getiri %": te["Toplam getiri %"], "Test işlem": n(te), "Test KF": te["Kâr faktörü"]}
+
+    pd.set_option("display.width", 250)
+    pd.set_option("display.max_colwidth", 46)
+    singles = []
+    for p in INDICATORS:
+        singles.append(row(p, None))
+        print(f"  {p} tamam", flush=True)
+    t = pd.DataFrame(singles).sort_values("Eğitim KF", ascending=False)
+    print("\n=== 1) TEK BAŞINA (eğitim kâr faktörüne göre sıralı)")
+    print(t.drop(columns=["Onay", "kod", "onay_kod"]).set_index("Giriş").to_string())
+    out = ROOT / "data" / "indicator_results.csv"
+    out.parent.mkdir(exist_ok=True)
+    allrows = singles
+    if pairs:
+        chosen = [r["kod"] for r in t.to_dict("records") if r["Eğitim işlem"] >= 30][:top]
+        print(f"\n=== 2) İKİLİ: eğitimde en iyi {top} indikatör + yaygın önerilen eşleri: {', '.join(chosen)}")
+        prow = []
+        for p in chosen:
+            prow.append(next(r for r in singles if r["kod"] == p))
+            for c in COMMON_PAIRS[p]:
+                prow.append(row(p, c))
+            print(f"  {p} tamam", flush=True)
+        pt = pd.DataFrame(prow)
+        print(pt.drop(columns=["kod", "onay_kod"]).to_string(index=False))
+        allrows = singles + [r for r in prow if r["onay_kod"]]
+    pd.DataFrame(allrows).to_csv(out, index=False)
+    print(f"\nSonuçlar: {out}")
+    print("Not: KF = kâr faktörü. Seçimi EĞİTİM sütunlarına göre yapın; test sütunları sadece doğrulama içindir.")
+    print("Çok sayıda kombinasyon denendiğinde biri şans eseri iyi çıkabilir: ayar hassasiyetine ve coin bazında")
+    print("sonuçlara da bakın (python main.py backtest).")
+
+
 def cmd_collect(cfg, archive_days):
     from bot.collector import METRICS_DIR, backfill_archive, collect_recent
     print(f"Open interest ve long/short oranları toplanıyor → {METRICS_DIR}")
@@ -225,7 +278,9 @@ def cmd_collect(cfg, archive_days):
 
 def cmd_analyze(cfg, split, horizon):
     """Open interest / long-short / taker metriklerinin sonraki `horizon` saatlik getiriyle ilişkisi.
-    Sadece EĞİTİM döneminde ölçülür. Tüm coinler birlikte değerlendirilir (her coin kendi içinde sıralanır)."""
+    Sadece EĞİTİM döneminde ölçülür, tüm coinler birlikte değerlendirilir.
+    Her metrik, stratejide kullanılacağı gibi GELECEĞİ GÖRMEDEN normalize edilir: o anki değer, yalnızca
+    önceki 30 günün ortalama ve sapmasına göre z-skoruna çevrilir; arşiv değerleri 1 mum gecikmeyle kullanılır."""
     import numpy as np
     from bot.collector import METRICS_DIR
     data, _ = load_history(cfg)
@@ -237,7 +292,7 @@ def cmd_analyze(cfg, split, horizon):
             continue
         a = pd.read_csv(path, index_col=0, parse_dates=True)
         a.columns = names[:len(a.columns)]
-        df = px.join(a, how="inner")
+        df = px.join(a.shift(1), how="inner")          # arşiv saati T -> T+1'de kesin bilinir
         cut = df.index[int(len(df) * split)]
         tr = df.loc[:cut]
         c = tr["close"]
@@ -250,7 +305,9 @@ def cmd_analyze(cfg, split, horizon):
             "Taker alış/satış (24s ort.)": tr["taker_ratio"].rolling(24).mean(),
             "(referans) son 24s getiri": c.pct_change(24),
         })
-        ranked = feats.rank(pct=True)                   # her coin kendi içinde sıralanır
+        win = 30 * 24
+        ranked = (feats - feats.rolling(win, min_periods=win // 3).mean()) / \
+            feats.rolling(win, min_periods=win // 3).std()   # yalnızca geçmiş 30 güne göre z-skoru
         ranked["fwd"] = c.shift(-horizon) / c - 1
         pooled.append(ranked.iloc[::horizon].dropna())  # örtüşmeyen pencereler
         coins.append(sym)
@@ -261,7 +318,7 @@ def cmd_analyze(cfg, split, horizon):
     n = len(d)
     rows = []
     for col in [c for c in d.columns if c != "fwd"]:
-        q = pd.qcut(d[col], 5, labels=False, duplicates="drop")
+        q = pd.qcut(d[col].rank(method="first"), 5, labels=False)
         g = d.groupby(q)["fwd"].mean() * 100
         rows.append({"Metrik": col, "Sıra korelasyonu": round(d[col].corr(d["fwd"], method="spearman"), 3),
                      f"En düşük %20 → {horizon}s getiri %": round(g.iloc[0], 2),
@@ -270,6 +327,8 @@ def cmd_analyze(cfg, split, horizon):
     print(f"{len(coins)} coin ({', '.join(c.split('/')[0] for c in coins)}) | eğitim dönemi | {n} gözlem\n")
     print(pd.DataFrame(rows).set_index("Metrik").to_string())
     print(f"\nKaba anlamlılık eşiği: |korelasyon| > {2 / np.sqrt(n):.3f}. Bunun altındakiler büyük olasılıkla gürültüdür.")
+    print("Uyarı: 7 metrik x birkaç ufuk denendiğinde biri şans eseri eşiği geçebilir; aday metrik test döneminde "
+          "ve coin bazında ayrıca doğrulanmalıdır.")
 
 
 def cmd_info(cfg):
@@ -343,8 +402,8 @@ def cmd_resume(cfg):
 
 def main():
     ap = argparse.ArgumentParser(description="Finans İşlem Botu (Binance Futures)")
-    ap.add_argument("command", choices=["backtest", "layers", "collect", "analyze", "info", "run", "status", "report",
-                                        "resume"])
+    ap.add_argument("command", choices=["backtest", "layers", "indicators", "collect", "analyze", "info", "run",
+                                        "status", "report", "resume"])
     ap.add_argument("--config", default=None)
     ap.add_argument("--synthetic", action="store_true", help="sahte veriyle backtest")
     ap.add_argument("--refresh", action="store_true", help="geçmiş veriyi yeniden indir")
@@ -353,10 +412,13 @@ def main():
     ap.add_argument("--tf", default=None, help="layers için zaman dilimi (ör. 4h; 1s veriden üretilir)")
     ap.add_argument("--archive", type=int, default=0, help="collect: arşivden kaç günlük geçmiş denensin")
     ap.add_argument("--horizon", type=int, default=24, help="analyze: kaç saatlik ileri getiri")
+    ap.add_argument("--pairs", action="store_true", help="indicators: en iyileri yaygın eşleriyle ikili test et")
+    ap.add_argument("--top", type=int, default=5, help="indicators --pairs: kaç indikatör seçilsin")
     a = ap.parse_args()
     cfg = load_config(a.config)
     {"backtest": lambda: cmd_backtest(cfg, a.synthetic, a.refresh, a.split, a.compare),
      "layers": lambda: cmd_layers(cfg, a.split or 0.7, a.tf),
+     "indicators": lambda: cmd_indicators(cfg, a.split or 0.7, a.pairs, a.top),
      "collect": lambda: cmd_collect(cfg, a.archive),
      "analyze": lambda: cmd_analyze(cfg, a.split or 0.7, a.horizon),
      "info": lambda: cmd_info(cfg), "run": lambda: cmd_run(cfg), "status": lambda: cmd_status(cfg),

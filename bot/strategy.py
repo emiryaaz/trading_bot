@@ -256,6 +256,9 @@ STRATEGIES = {
 
 def build_strategy(cfg: dict) -> Strategy:
     s = cfg["strategy"]
+    if "signal" not in STRATEGIES:
+        from .signals import SignalStrategy                # döngüsel import'u önlemek için burada
+        STRATEGIES["signal"] = SignalStrategy
     if s["name"] not in STRATEGIES:
         raise ValueError(f"Bilinmeyen strateji: {s['name']}. Seçenekler: {list(STRATEGIES)}")
     return STRATEGIES[s["name"]](**(s.get("params") or {}))
